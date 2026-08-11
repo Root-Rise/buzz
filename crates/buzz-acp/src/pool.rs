@@ -1433,15 +1433,24 @@ pub async fn run_prompt_task(
     // declared before `liveness_guard`: Rust drops locals in reverse order, so
     // liveness is aborted before completion makes the turn terminal.
     // apiary: in-channel progress reporter. Silent unless the turn uses tools.
-    if let (PromptSource::Channel(progress_cid), Some(progress_root)) =
+    if let (PromptSource::Channel(progress_cid), Some(progress_trigger)) =
         (&source, triggering_event_ids.first())
     {
+        // Root at the trigger's own thread root when the mention arrived
+        // inside a thread; else the trigger is the root. Parent is always
+        // the trigger, so progress nests directly under the ask.
+        let progress_root = batch
+            .as_ref()
+            .and_then(|b| b.events.first())
+            .and_then(|be| crate::queue::parse_thread_tags(&be.event).root_event_id)
+            .unwrap_or_else(|| progress_trigger.clone());
         let (ptx, prx) = tokio::sync::mpsc::unbounded_channel();
         agent.acp.set_progress_sink(ptx);
         crate::progress::spawn_reporter(
             ctx.rest_client.clone(),
             *progress_cid,
-            progress_root.clone(),
+            progress_root,
+            progress_trigger.clone(),
             prx,
         );
     }

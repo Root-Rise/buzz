@@ -79,6 +79,7 @@ pub fn spawn_reporter(
     rest: crate::relay::RestClient,
     channel_id: Uuid,
     root_event_hex: String,
+    parent_event_hex: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<ProgressEvent>,
 ) {
     tokio::spawn(async move {
@@ -91,9 +92,10 @@ pub fn spawn_reporter(
             Ok(i) => i,
             Err(_) => return,
         };
+        let parent_id = nostr::EventId::from_hex(&parent_event_hex).unwrap_or(root_id);
         let tref = buzz_sdk::ThreadRef {
             root_event_id: root_id,
-            parent_event_id: root_id,
+            parent_event_id: parent_id,
         };
         let started = Instant::now();
         let mut lines: VecDeque<String> = VecDeque::new();
