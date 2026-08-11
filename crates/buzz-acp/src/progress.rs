@@ -92,10 +92,13 @@ pub fn spawn_reporter(
             Ok(i) => i,
             Err(_) => return,
         };
-        let parent_id = nostr::EventId::from_hex(&parent_event_hex).unwrap_or(root_id);
+        // parent == root, matching the desktop thread composer idiom: the UI
+        // renders parent==root inline; parent==another-reply becomes a
+        // collapsed sub-thread ("threads in threads"). Flat wins.
+        let _ = &parent_event_hex; // retained in the signature for future use
         let tref = buzz_sdk::ThreadRef {
             root_event_id: root_id,
-            parent_event_id: parent_id,
+            parent_event_id: root_id,
         };
         let started = Instant::now();
         let mut lines: VecDeque<String> = VecDeque::new();
