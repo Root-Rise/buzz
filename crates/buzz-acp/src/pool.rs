@@ -1366,6 +1366,7 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    agent.acp.clear_progress_sink();
     let _ = result_tx.send(PromptResult {
         agent,
         source,
@@ -1431,6 +1432,20 @@ pub async fn run_prompt_task(
     // metadata now, before the agent is moved into PromptResult. It must be
     // declared before `liveness_guard`: Rust drops locals in reverse order, so
     // liveness is aborted before completion makes the turn terminal.
+    // apiary: in-channel progress reporter. Silent unless the turn uses tools.
+    if let (PromptSource::Channel(progress_cid), Some(progress_root)) =
+        (&source, triggering_event_ids.first())
+    {
+        let (ptx, prx) = tokio::sync::mpsc::unbounded_channel();
+        agent.acp.set_progress_sink(ptx);
+        crate::progress::spawn_reporter(
+            ctx.rest_client.clone(),
+            *progress_cid,
+            progress_root.clone(),
+            prx,
+        );
+    }
+
     let _turn_guard = TurnCompletionGuard::new(
         agent.acp.observer_handle(),
         agent.acp.observer_agent_index(),

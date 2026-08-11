@@ -172,6 +172,8 @@ pub struct AcpClient {
     observer_agent_index: Option<usize>,
     /// Best-effort context attached to raw ACP wire events.
     observer_context: ObserverContext,
+    /// apiary: per-turn sink feeding the in-channel progress reporter.
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::progress::ProgressEvent>>,
     /// Most recently observed `_meta.goose.activeRunId` from a
     /// `session/update` notification of kind `session_info_update`.
     ///
@@ -546,6 +548,7 @@ impl AcpClient {
             observer: None,
             observer_agent_index: None,
             observer_context: ObserverContext::default(),
+            progress_tx: None,
             active_run_id: None,
             steering_supported: false,
             steer_rx: None,
@@ -560,6 +563,14 @@ impl AcpClient {
     }
 
     /// Update metadata that will be attached to subsequent raw wire events.
+    pub(crate) fn set_progress_sink(&mut self, tx: tokio::sync::mpsc::UnboundedSender<crate::progress::ProgressEvent>) {
+        self.progress_tx = Some(tx);
+    }
+
+    pub(crate) fn clear_progress_sink(&mut self) {
+        self.progress_tx = None;
+    }
+
     pub fn set_observer_context(&mut self, context: ObserverContext) {
         self.observer_context = context;
     }
@@ -1745,6 +1756,9 @@ impl AcpClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 tracing::info!(target: "acp::tool", "tool_call: {title} ({kind})");
+                if let Some(tx) = &self.progress_tx {
+                    let _ = tx.send(crate::progress::ProgressEvent { title: title.to_string(), kind: kind.to_string() });
+                }
                 true
             }
             "tool_call_update" => {

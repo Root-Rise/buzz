@@ -8,6 +8,7 @@ mod observer;
 mod pool;
 mod pool_lifecycle;
 mod queue;
+pub(crate) mod progress;
 mod relay;
 mod setup_mode;
 mod usage;
