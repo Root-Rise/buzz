@@ -1277,10 +1277,14 @@ fn format_context_hints(
                     s.push_str(&format!("\nParent: {parent}"));
                 }
             }
-            if let Some(event_id) = reply_anchor {
-                append_reply_instruction(&mut s, event_id);
-            }
         }
+        // apiary: DMs read as flat conversations. Threading adds structure a
+        // two-party conversation doesn't need, so replies are always top-level.
+        s.push_str(
+            "\nIMPORTANT: This is a direct-message conversation. Send replies as \
+             plain top-level messages WITHOUT --reply-to - DMs read as a flat \
+             conversation, not threads.",
+        );
         s
     } else if let Some(ref root) = thread_tags.root_event_id {
         let ctx_hint = if has_conversation_context {

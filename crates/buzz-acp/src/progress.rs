@@ -78,8 +78,7 @@ async fn submit(
 pub fn spawn_reporter(
     rest: crate::relay::RestClient,
     channel_id: Uuid,
-    root_event_hex: String,
-    parent_event_hex: String,
+    thread_root_hex: Option<String>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<ProgressEvent>,
 ) {
     tokio::spawn(async move {
@@ -88,18 +87,14 @@ pub fn spawn_reporter(
             Some(e) => e,
             None => return,
         };
-        let root_id = match nostr::EventId::from_hex(&root_event_hex) {
-            Ok(i) => i,
-            Err(_) => return,
-        };
-        // parent == root, matching the desktop thread composer idiom: the UI
-        // renders parent==root inline; parent==another-reply becomes a
-        // collapsed sub-thread ("threads in threads"). Flat wins.
-        let _ = &parent_event_hex; // retained in the signature for future use
-        let tref = buzz_sdk::ThreadRef {
-            root_event_id: root_id,
-            parent_event_id: root_id,
-        };
+        // parent == root (flat threads); None in DMs (flat conversation).
+        let tref = thread_root_hex
+            .as_deref()
+            .and_then(|h| nostr::EventId::from_hex(h).ok())
+            .map(|root_id| buzz_sdk::ThreadRef {
+                root_event_id: root_id,
+                parent_event_id: root_id,
+            });
         let started = Instant::now();
         let mut lines: VecDeque<String> = VecDeque::new();
         let mut total = 0usize;
@@ -116,7 +111,7 @@ pub fn spawn_reporter(
         push(&mut lines, &mut total, &first);
 
         let content = render(&lines, total, started.elapsed(), false);
-        let builder = match buzz_sdk::build_message(channel_id, &content, Some(&tref), &[], false, &[])
+        let builder = match buzz_sdk::build_message(channel_id, &content, tref.as_ref(), &[], false, &[])
         {
             Ok(b) => b,
             Err(e) => {

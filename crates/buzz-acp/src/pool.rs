@@ -1436,21 +1436,25 @@ pub async fn run_prompt_task(
     if let (PromptSource::Channel(progress_cid), Some(progress_trigger)) =
         (&source, triggering_event_ids.first())
     {
-        // Root at the trigger's own thread root when the mention arrived
-        // inside a thread; else the trigger is the root. Parent is always
-        // the trigger, so progress nests directly under the ask.
-        let progress_root = batch
-            .as_ref()
-            .and_then(|b| b.events.first())
-            .and_then(|be| crate::queue::parse_thread_tags(&be.event).root_event_id)
-            .unwrap_or_else(|| progress_trigger.clone());
+        // Thread root: the trigger's own root when it arrived in a thread,
+        // else the trigger itself. DMs are flat: no thread ref at all.
+        let progress_thread = if crate::is_dm_channel(*progress_cid, &ctx.channel_info).await {
+            None
+        } else {
+            Some(
+                batch
+                    .as_ref()
+                    .and_then(|b| b.events.first())
+                    .and_then(|be| crate::queue::parse_thread_tags(&be.event).root_event_id)
+                    .unwrap_or_else(|| progress_trigger.clone()),
+            )
+        };
         let (ptx, prx) = tokio::sync::mpsc::unbounded_channel();
         agent.acp.set_progress_sink(ptx);
         crate::progress::spawn_reporter(
             ctx.rest_client.clone(),
             *progress_cid,
-            progress_root,
-            progress_trigger.clone(),
+            progress_thread,
             prx,
         );
     }

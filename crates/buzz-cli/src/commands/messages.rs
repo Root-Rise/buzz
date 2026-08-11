@@ -77,9 +77,12 @@ async fn resolve_thread_ref(
         _ => parent_eid,
     };
 
+    // apiary: parent == root always. The desktop renders parent==root inline
+    // and parent==another-reply as a collapsed sub-thread; flat threads match
+    // the composer idiom and avoid threads-in-threads.
     Ok(ThreadRef {
         root_event_id: root_eid,
-        parent_event_id: parent_eid,
+        parent_event_id: root_eid,
     })
 }
 
