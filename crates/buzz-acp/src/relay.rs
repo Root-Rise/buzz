@@ -3193,7 +3193,7 @@ async fn send_subscribe(
     // #h — always present (channel scope).
     req_filter.insert("#h".into(), json!([channel_id.to_string()]));
 
-    tracing::info!(channel = %channel_id, require_mention = filter.require_mention, "apiary: building subscribe filter");
+    tracing::debug!(channel = %channel_id, require_mention = filter.require_mention, "subscribe filter");
     // #p — only when require_mention is true.
     if filter.require_mention {
         req_filter.insert("#p".into(), json!([agent_pubkey_hex]));
