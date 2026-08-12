@@ -9,6 +9,7 @@ mod pool;
 mod pool_lifecycle;
 mod queue;
 pub(crate) mod progress;
+pub(crate) mod attention;
 mod relay;
 mod setup_mode;
 mod usage;
@@ -1978,6 +1979,8 @@ async fn tokio_main() -> Result<()> {
     // causal invalidation is needed, add a monotonic epoch counter per channel
     // and capture it in TaskMeta at dispatch time.
     let mut removed_channels: HashSet<Uuid> = HashSet::new();
+    // apiary: thread-attention state (engaged threads + agent roster).
+    let mut attention = crate::attention::Attention::new();
 
     //
     // One SlotCircuit per agent slot. crash_times entries are pruned to the last
@@ -2474,7 +2477,45 @@ async fn tokio_main() -> Result<()> {
                                 }
                             }
 
-                            let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;
+                            let mut attention_wake = false;
+                            // apiary: thread-attention gate. With the flag on we
+                            // receive the whole channel, so restore mention-only
+                            // behavior here EXCEPT for follow-ups inside threads
+                            // this agent is already engaged in (human authors only
+                            // — agents still wake each other by mention).
+                            if config.thread_attention {
+                                if attention.agent_roster_stale() {
+                                    if let Some(set) =
+                                        crate::attention::fetch_agent_pubkeys(&ctx.rest_client).await
+                                    {
+                                        attention.set_agents(set);
+                                    }
+                                }
+                                let mentions_us = crate::queue::parse_thread_tags(&buzz_event.event)
+                                    .mentioned_pubkeys
+                                    .iter()
+                                    .any(|p| p == &pubkey_hex);
+                                if !mentions_us
+                                    && !attention.should_wake(buzz_event.channel_id, &buzz_event.event)
+                                {
+                                    continue; // not for us
+                                }
+                                if mentions_us {
+                                    tracing::debug!(
+                                        channel_id = %buzz_event.channel_id,
+                                        "thread attention: engaging thread via mention"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        channel_id = %buzz_event.channel_id,
+                                        "thread attention: woken by follow-up without mention"
+                                    );
+                                    attention_wake = true;
+                                }
+                                attention.engage(buzz_event.channel_id, &buzz_event.event);
+                            }
+
+                            let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex, attention_wake).await;
                             let prompt_tag = match matched {
                                 Some(m) => m.prompt_tag,
                                 None => {

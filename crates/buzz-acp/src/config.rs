@@ -373,6 +373,12 @@ pub struct CliArgs {
           value_parser = clap::value_parser!(u32))]
     pub max_turns_per_session: u32,
 
+    /// apiary: hear follow-ups in threads this agent is already engaged in,
+    /// without requiring a re-@mention. Subscribes channel-wide and gates
+    /// client-side; agent authors still require an explicit mention.
+    #[arg(long, env = "BUZZ_ACP_THREAD_ATTENTION")]
+    pub thread_attention: bool,
+
     /// Disable automatic presence (online/offline) status.
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
     pub no_presence: bool,
@@ -524,6 +530,7 @@ pub struct Config {
     pub context_message_limit: u32,
     /// Maximum turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
+    pub thread_attention: bool,
     pub presence_enabled: bool,
     pub typing_enabled: bool,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
@@ -1090,6 +1097,7 @@ impl Config {
             config_path: args.config,
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
+            thread_attention: args.thread_attention,
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
             memory_enabled: args.memory && !args.no_memory,
@@ -1268,7 +1276,10 @@ pub fn resolve_channel_filters(
                     KIND_STREAM_REMINDER,
                 ]
             });
-            let require_mention = !config.no_mention_filter;
+            // apiary: thread attention needs the unfiltered stream so it can see
+            // follow-ups that do not mention the agent; the client-side gate in
+            // lib.rs restores mention-only behavior for everything else.
+            let require_mention = !config.no_mention_filter && !config.thread_attention;
             for ch in &target_channels {
                 result.insert(
                     *ch,
@@ -1373,7 +1384,10 @@ pub fn resolve_dynamic_channel_filter(
                     KIND_STREAM_REMINDER,
                 ]
             })),
-            require_mention: !config.no_mention_filter,
+            // apiary: thread attention needs the unfiltered stream so it can
+        // see follow-ups that do not mention the agent; the client-side
+        // gate in lib.rs restores mention-only behavior otherwise.
+        require_mention: !config.no_mention_filter && !config.thread_attention,
         }),
         SubscribeMode::All => Some(ChannelFilter {
             kinds: config.kinds_override.clone(),
@@ -1464,6 +1478,7 @@ mod tests {
             config_path: PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            thread_attention: false,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: true,
