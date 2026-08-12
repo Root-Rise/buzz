@@ -1743,12 +1743,10 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
-                    if let Some(tx) = &self.progress_tx {
-                        let _ = tx.send(crate::progress::ProgressEvent {
-                            title: text.to_string(),
-                            kind: "say".to_string(),
-                        });
-                    }
+                    // Deliberately NOT fed to the progress log: the final
+                    // answer streams as message chunks, so surfacing them
+                    // duplicated the reply into the working log with no
+                    // visual boundary. Reasoning (think) + tool calls only.
                 }
                 false
             }
