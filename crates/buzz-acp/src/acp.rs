@@ -1743,6 +1743,12 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    if let Some(tx) = &self.progress_tx {
+                        let _ = tx.send(crate::progress::ProgressEvent {
+                            title: text.to_string(),
+                            kind: "say".to_string(),
+                        });
+                    }
                 }
                 false
             }
@@ -1777,6 +1783,12 @@ impl AcpClient {
             "agent_thought_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::debug!(target: "acp::thought", "{text}");
+                    if let Some(tx) = &self.progress_tx {
+                        let _ = tx.send(crate::progress::ProgressEvent {
+                            title: text.to_string(),
+                            kind: "think".to_string(),
+                        });
+                    }
                 }
                 false
             }
