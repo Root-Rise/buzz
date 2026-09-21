@@ -921,6 +921,9 @@ pub enum UsersCmd {
         /// Display name
         #[arg(long)]
         name: Option<String>,
+        /// Username (the kind:0 `name` field). Preserved when omitted.
+        #[arg(long)]
+        username: Option<String>,
         /// Avatar URL
         #[arg(long)]
         avatar: Option<String>,
