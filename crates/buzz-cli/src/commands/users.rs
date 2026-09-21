@@ -359,13 +359,19 @@ async fn search_by_name(
 pub async fn cmd_set_profile(
     client: &BuzzClient,
     display_name: Option<&str>,
+    username: Option<&str>,
     avatar_url: Option<&str>,
     about: Option<&str>,
     nip05_handle: Option<&str>,
 ) -> Result<(), CliError> {
-    if display_name.is_none() && avatar_url.is_none() && about.is_none() && nip05_handle.is_none() {
+    if display_name.is_none()
+        && username.is_none()
+        && avatar_url.is_none()
+        && about.is_none()
+        && nip05_handle.is_none()
+    {
         return Err(CliError::Usage(
-            "at least one field required (--name, --avatar, --about, --nip05)".into(),
+            "at least one field required (--name, --username, --avatar, --about, --nip05)".into(),
         ));
     }
 
@@ -406,9 +412,18 @@ pub async fn cmd_set_profile(
             .map(|s| s.to_string())
     });
 
+    // `name` is merged like every other field: a read-merge-write that passed
+    // None here would delete the username on any unrelated profile edit.
+    let merged_username = username.map(|s| s.to_string()).or_else(|| {
+        current
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
     let builder = buzz_sdk::build_profile(
         merged_name.as_deref(),
-        None, // `name` field (username) — not exposed by CLI
+        merged_username.as_deref(),
         merged_picture.as_deref(),
         merged_about.as_deref(),
         merged_nip05.as_deref(),
@@ -543,6 +558,7 @@ pub async fn dispatch(
         } => cmd_get_users(client, &pubkeys, name.as_deref(), owner.as_deref(), format).await,
         UsersCmd::SetProfile {
             name,
+            username,
             avatar,
             about,
             nip05,
@@ -550,6 +566,7 @@ pub async fn dispatch(
             cmd_set_profile(
                 client,
                 name.as_deref(),
+                username.as_deref(),
                 avatar.as_deref(),
                 about.as_deref(),
                 nip05.as_deref(),
