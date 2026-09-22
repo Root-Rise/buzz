@@ -49,9 +49,15 @@ fn thread_ref_from_parent_tags(
         _ => parent_eid,
     };
 
+    // apiary: parent == root always. The desktop renders parent==root inline and
+    // parent==another-reply as a collapsed sub-thread, so parent-at-trigger adds
+    // a nesting level per exchange — unreadable in a ticket thread that lives for
+    // days. Flat matches the composer idiom and what every participant here was
+    // already producing before this was briefly lost in the 2026-09-22 upgrade.
+    let _ = parent_eid; // kept: it is still the caller's stated target
     Ok(ThreadRef {
         root_event_id: root_eid,
-        parent_event_id: parent_eid,
+        parent_event_id: root_eid,
     })
 }
 
