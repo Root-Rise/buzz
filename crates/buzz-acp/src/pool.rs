@@ -131,6 +131,9 @@ pub struct ChannelDeliveryState {
 pub struct SessionState {
     /// session scope → session_id
     pub sessions: HashMap<SessionScope, String>,
+    /// The same mapping, on disk, so a restart resumes instead of starting cold.
+    /// Default (no path) persists nothing, which is the pre-W2 behaviour.
+    pub store: crate::session_store::SessionStore,
     pub heartbeat_session: Option<String>,
     /// Per-scope turn counters for proactive session rotation.
     /// Incremented on each successful prompt; reset when the session is rotated.
@@ -160,6 +163,15 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// Fresh state that remembers its sessions across restarts.
+    pub fn with_store(store: crate::session_store::SessionStore) -> Self {
+        Self {
+            store,
+            ..Default::default()
+        }
+    }
+
+
     pub(crate) fn set_scope_owner_generation(&mut self, scope: SessionScope, generation: u64) {
         self.scope_owner_generations.insert(scope, generation);
     }
@@ -186,6 +198,7 @@ impl SessionState {
         self.canvas_sections.remove(scope);
         self.deliveries.remove(scope);
         self.scope_owner_generations.remove(scope);
+        self.store.remove(scope);
         self.sessions.remove(scope).is_some()
     }
 
@@ -217,6 +230,9 @@ impl SessionState {
 
     /// Invalidate all sessions and turn counters (e.g. after agent exit).
     pub fn invalidate_all(&mut self) {
+        // Persisted ids go too: they name sessions we have just disowned, and a
+        // restart must not resurrect one of them.
+        self.store.clear();
         self.sessions.clear();
         self.turn_counts.clear();
         self.heartbeat_session = None;
@@ -235,8 +251,9 @@ impl SessionState {
         event_ids: impl IntoIterator<Item = String>,
         hydrated_thread_roots: impl IntoIterator<Item = String>,
     ) {
-        let delivery = self.deliveries.entry(scope).or_default();
+        let delivery = self.deliveries.entry(scope.clone()).or_default();
         delivery.standing_context_sent |= standing_context_sent;
+        let primed = delivery.standing_context_sent;
         delivery.delivered_event_ids.extend(event_ids);
         for root in hydrated_thread_roots {
             if delivery.hydrated_thread_roots.contains(&root) {
@@ -246,6 +263,13 @@ impl SessionState {
                 delivery.hydrated_thread_roots.pop_front();
             }
             delivery.hydrated_thread_roots.push_back(root);
+        }
+        // The mutable borrow of `deliveries` ends here, so the store can record
+        // that this session now holds its standing context.
+        if primed {
+            if let Some(session_id) = self.sessions.get(&scope).cloned() {
+                self.store.mark_primed(&scope, &session_id);
+            }
         }
     }
 
@@ -2505,6 +2529,8 @@ pub async fn run_prompt_task(
             let cid = &scope.channel_id();
             if let Some(sid) = agent.state.sessions.get(scope) {
                 (sid.clone(), false)
+            } else if let Some(resumed) = try_resume_session(&mut agent, &ctx, scope).await {
+                (resumed, false)
             } else {
                 // The title includes channel and, for thread sessions, the
                 // canonical root prefix so sibling sessions are distinguishable.
@@ -2530,6 +2556,7 @@ pub async fn run_prompt_task(
                             scope.telemetry_label()
                         );
                         agent.state.sessions.insert(scope.clone(), sid.clone());
+                        agent.state.store.insert(scope, &sid);
                         agent
                             .state
                             .deliveries
@@ -3919,6 +3946,61 @@ fn conversation_context_delta(
                 total,
                 truncated: truncated || omitted_from_prior_session,
             })
+        }
+    }
+}
+
+/// Reattach to a session this agent held before a restart, if one is recorded.
+///
+/// Returns the session id on success. `None` means "carry on and create a new
+/// one" — every failure path is non-fatal, because a cold session is correct
+/// behaviour and exactly what happened before W2.
+///
+/// A stale entry is dropped rather than retried: the agent may have pruned the
+/// transcript, in which case no amount of retrying will bring it back.
+///
+/// Resuming deliberately does NOT seed a zero usage baseline the way creation
+/// does. A resumed session carries prior usage; claiming otherwise would make
+/// the first turn's budget arithmetic wrong.
+async fn try_resume_session(
+    agent: &mut OwnedAgent,
+    ctx: &PromptContext,
+    scope: &SessionScope,
+) -> Option<String> {
+    let stored = agent.state.store.get(scope)?.clone();
+    let session_id = stored.id;
+    match agent
+        .acp
+        .session_load(&session_id, &ctx.cwd, ctx.mcp_servers.clone())
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(
+                target: "pool::session",
+                "resumed session {session_id} across restart (scope {})",
+                scope.telemetry_label()
+            );
+            agent.state.sessions.insert(scope.clone(), session_id.clone());
+            // Carry forward whether this session already holds its standing
+            // context. Defaulting the whole delivery state re-sent <base> on
+            // every restart, which showed up as a repeated header in the client.
+            agent.state.deliveries.insert(
+                scope.clone(),
+                ChannelDeliveryState {
+                    standing_context_sent: stored.primed,
+                    ..Default::default()
+                },
+            );
+            Some(session_id)
+        }
+        Err(err) => {
+            tracing::info!(
+                target: "pool::session",
+                "could not resume {session_id} (scope {}): {err}; starting a new session",
+                scope.telemetry_label()
+            );
+            agent.state.store.remove(scope);
+            None
         }
     }
 }

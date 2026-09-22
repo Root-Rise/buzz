@@ -702,6 +702,35 @@ impl AcpClient {
         })
     }
 
+    /// Resume a session the agent already holds (`session/load`).
+    ///
+    /// The agent persists its own transcripts, so a session that buzz-acp created
+    /// before a restart is still on disk — only the in-memory scope→id map is lost.
+    /// This reattaches to one instead of starting cold.
+    ///
+    /// Per the ACP spec the agent streams the prior conversation back as
+    /// `session/update` notifications before answering, so the caller must be
+    /// ready to receive them. A failure here is never fatal: the caller falls back
+    /// to `session/new`, which is exactly today's behaviour.
+    ///
+    /// Only call this when the agent advertised `loadSession` at initialize; an
+    /// agent without it answers with a method-not-found error.
+    pub async fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<(), AcpError> {
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": mcp_servers,
+        });
+        self.send_request("session/load", params).await?;
+        tracing::info!(target: "acp::session", "session resumed: {session_id}");
+        Ok(())
+    }
+
     /// Send `session/new` and return only the `sessionId` string.
     ///
     /// Convenience wrapper around [`session_new_full`].

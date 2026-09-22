@@ -12,6 +12,7 @@ mod prompt_project;
 mod queue;
 mod relay;
 mod scope;
+mod session_store;
 mod setup_mode;
 mod usage;
 
@@ -3070,7 +3071,13 @@ async fn tokio_main() -> Result<()> {
                     let agent = OwnedAgent {
                         index: rr.index,
                         acp,
-                        state: SessionState::default(),
+                        // A respawn after a crash reopens the SAME map, so the
+                        // agent rejoins its threads instead of starting cold.
+                        state: SessionState::with_store(
+                            crate::session_store::SessionStore::open(
+                                &config.keys.public_key().to_hex(),
+                            ),
+                        ),
                         model_capabilities: None,
                         desired_model: config.model.clone(),
                         model_overridden: false,
@@ -5443,6 +5450,9 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
 
 struct PoolStartup {
     agents: u32,
+    /// Identity of this bot. The persisted session map is keyed on it, so two
+    /// bots on one host can never resume into each other's sessions.
+    pubkey_hex: String,
     command: String,
     args: Vec<String>,
     extra_env: Vec<(String, String)>,
@@ -5456,6 +5466,7 @@ impl PoolStartup {
     fn from_config(config: &Config, observer: Option<observer::ObserverHandle>) -> Self {
         Self {
             agents: config.agents,
+            pubkey_hex: config.keys.public_key().to_hex(),
             command: config.agent_command.clone(),
             args: config.agent_args.clone(),
             extra_env: config.persona_env_vars.clone(),
@@ -5525,7 +5536,9 @@ async fn initialize_agent_pool(
                         agent_slots.push(Some(OwnedAgent {
                             index: i,
                             acp,
-                            state: SessionState::default(),
+                            state: SessionState::with_store(
+                                crate::session_store::SessionStore::open(&startup.pubkey_hex),
+                            ),
                             model_capabilities: None,
                             desired_model: startup.model.clone(),
                             model_overridden: false,
