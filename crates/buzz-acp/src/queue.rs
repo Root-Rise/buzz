@@ -23,6 +23,8 @@ use crate::prompt_project::PromptProjectInfo;
 use crate::config::DedupMode;
 use crate::scope::SessionScope;
 
+mod durable;
+
 /// Maximum events queued per session scope before oldest events are dropped.
 ///
 /// Under the `channel` policy there is exactly one scope per channel, so this
@@ -197,6 +199,7 @@ pub struct FlushBatch {
 ///     else: push_front with original received_at, set exponential backoff retry_after with jitter
 /// ```
 pub struct EventQueue {
+    durable: Option<crate::bridge_state::BridgeState>,
     queues: HashMap<SessionScope, VecDeque<QueuedEvent>>,
     in_flight_scopes: HashSet<SessionScope>,
     /// Per-scope deadline for auto-expiring stuck in-flight entries.
@@ -240,6 +243,7 @@ impl EventQueue {
     /// derive the deadline from the configured `max_turn_duration`.
     pub fn new(dedup_mode: DedupMode) -> Self {
         Self {
+            durable: None,
             queues: HashMap::new(),
             in_flight_scopes: HashSet::new(),
             in_flight_deadlines: HashMap::new(),
@@ -292,6 +296,9 @@ impl EventQueue {
     ///
     /// Returns `true` if the event was accepted, `false` if dropped.
     pub fn push(&mut self, event: QueuedEvent) -> bool {
+        if self.durable.is_some() {
+            return self.push_journaled(event);
+        }
         debug_assert_eq!(
             event.scope.channel_id(),
             event.channel_id,
@@ -406,6 +413,7 @@ impl EventQueue {
             .iter()
             .filter(|(scope, q)| {
                 !q.is_empty()
+                    && self.durable_scope_ready(scope)
                     && !self.in_flight_scopes.contains(scope)
                     && self.retry_after.get(scope).is_none_or(|&t| t <= now)
             })

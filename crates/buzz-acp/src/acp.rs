@@ -88,6 +88,18 @@ pub enum AcpError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// Serve connection failed; the remote runtime is not a dead ACP process.
+    #[error("Serve unavailable: {0}")]
+    ServeUnavailable(String),
+
+    /// Submission may have executed. Never replay it as a new request.
+    #[error("Serve request outcome uncertain: {0}")]
+    SubmissionUncertain(String),
+
+    /// The correlated remote turn failed after acceptance.
+    #[error("Serve turn failed: {0}")]
+    RemoteTurnFailed(String),
+
     #[error("Agent process exited unexpectedly")]
     AgentExited,
 

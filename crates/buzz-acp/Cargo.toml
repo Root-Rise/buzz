@@ -41,6 +41,7 @@ reqwest = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+rusqlite = { version = ">=0.37,<0.38", features = ["bundled"] }
 
 # IDs
 uuid = { workspace = true }

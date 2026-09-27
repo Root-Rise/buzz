@@ -29,10 +29,12 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::acp::AcpClient;
 use crate::acp::{
     extract_model_config_options, extract_model_state, extract_thought_level_config_id,
-    model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
-    ModelSwitchMethod, StopReason, SystemPromptTransport, BUZZ_PI_ACP_NAME,
+    model_in_catalog, resolve_model_switch_method, AcpError, EnvVar, McpServer, ModelSwitchMethod,
+    StopReason, SystemPromptTransport, BUZZ_PI_ACP_NAME,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -129,6 +131,7 @@ pub struct ChannelDeliveryState {
 /// spawning a real agent subprocess.
 #[derive(Default)]
 pub struct SessionState {
+    pub(crate) durable: Option<crate::bridge_state::BridgeState>,
     /// session scope → session_id
     pub sessions: HashMap<SessionScope, String>,
     /// The same mapping, on disk, so a restart resumes instead of starting cold.
@@ -163,6 +166,13 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    pub(crate) fn with_durable(store: crate::bridge_state::BridgeState) -> Self {
+        Self {
+            durable: Some(store),
+            ..Self::default()
+        }
+    }
+
     /// Fresh state that remembers its sessions across restarts.
     pub fn with_store(store: crate::session_store::SessionStore) -> Self {
         Self {
@@ -170,7 +180,6 @@ impl SessionState {
             ..Default::default()
         }
     }
-
 
     pub(crate) fn set_scope_owner_generation(&mut self, scope: SessionScope, generation: u64) {
         self.scope_owner_generations.insert(scope, generation);
@@ -287,7 +296,7 @@ impl SessionState {
 /// An agent with its session state, owned by the pool or a running task.
 pub struct OwnedAgent {
     pub index: usize,
-    pub acp: AcpClient,
+    pub acp: crate::backend::BackendClient,
     pub state: SessionState,
     /// Model catalog from first session/new. None until first session created.
     pub model_capabilities: Option<AgentModelCapabilities>,
@@ -386,6 +395,8 @@ impl OwnedAgent {
 /// (running inside a spawned task). The `task_map` tracks in-flight
 /// tasks for panic recovery.
 pub struct AgentPool {
+    pub(crate) recovery_task: Option<crate::serve_recovery::RecoveryTask>,
+    server_owned: bool,
     agents: Vec<Option<OwnedAgent>>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
@@ -886,6 +897,10 @@ pub struct PromptContext {
 }
 
 impl AgentPool {
+    pub(crate) fn is_server_owned(&self) -> bool {
+        self.server_owned
+    }
+
     /// Create a pool from pre-indexed slots (may contain None for failed startups).
     ///
     /// Slot positions are preserved so that `agent.index` always matches the
@@ -895,6 +910,8 @@ impl AgentPool {
     pub fn from_slots(slots: Vec<Option<OwnedAgent>>) -> Self {
         let (result_tx, result_rx) = mpsc::unbounded_channel();
         Self {
+            recovery_task: None,
+            server_owned: slots.iter().flatten().any(|agent| agent.acp.is_serve()),
             agents: slots,
             result_tx,
             result_rx,
@@ -971,6 +988,18 @@ impl AgentPool {
         now: tokio::time::Instant,
         timeout: Duration,
     ) -> HoldDecision {
+        if self.server_owned {
+            if let Some(task) = self
+                .task_map
+                .values()
+                .find(|task| task.scope.as_ref() == Some(scope))
+            {
+                return HoldDecision::Hold {
+                    held_for: Duration::ZERO,
+                    owner_index: task.agent_index,
+                };
+            }
+        }
         if !scope.is_thread() || !self.should_hold_for_busy_owner(scope) {
             self.held_since.remove(scope);
             return HoldDecision::Dispatch;
@@ -1005,6 +1034,15 @@ impl AgentPool {
     ///
     /// Returns `None` if all agents are checked out.
     pub fn try_claim(&mut self, scope: Option<&SessionScope>) -> Option<OwnedAgent> {
+        if self.server_owned
+            && scope.is_some()
+            && self
+                .task_map
+                .values()
+                .any(|task| task.scope.as_ref() == scope)
+        {
+            return None;
+        }
         // Pass 1: prefer agent with existing session for this scope.
         if let Some(scope) = scope {
             let idx = self.agents.iter().position(|slot| {
@@ -1102,7 +1140,7 @@ impl AgentPool {
     /// worker. A worker return wakes the main loop independently, so arming an
     /// already-expired timer while every slot is checked out would only spin.
     pub(crate) fn next_hold_deadline(&self, timeout: Duration) -> Option<tokio::time::Instant> {
-        if !self.any_idle() {
+        if self.server_owned || !self.any_idle() {
             return None;
         }
         self.held_since
@@ -1830,7 +1868,7 @@ enum ModelSwitchOutcome {
 /// so the caller preserves pre-switch capabilities and tells Desktop the pick
 /// failed instead of silently claiming the switch landed.
 async fn apply_model_switch(
-    acp: &mut AcpClient,
+    acp: &mut crate::backend::BackendClient,
     session_id: &str,
     desired: &str,
     method: &ModelSwitchMethod,
@@ -2044,7 +2082,7 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) 
 /// **Fatal exception:** if the agent process exits (e.g., goose crashes on
 /// unrecognized methods), returns `Err(AgentExited)` so the caller can respawn.
 async fn apply_permission_mode(
-    acp: &mut AcpClient,
+    acp: &mut crate::backend::BackendClient,
     session_id: &str,
     mode: &PermissionMode,
 ) -> Result<(), AcpError> {
@@ -2529,7 +2567,20 @@ pub async fn run_prompt_task(
             let cid = &scope.channel_id();
             if let Some(sid) = agent.state.sessions.get(scope) {
                 (sid.clone(), false)
-            } else if let Some(resumed) = try_resume_session(&mut agent, &ctx, scope).await {
+            } else if let Some(resumed) = match try_resume_session(&mut agent, &ctx, scope).await {
+                Ok(session) => session,
+                Err(error) => {
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::Error(error),
+                        None,
+                    );
+                    return;
+                }
+            } {
                 (resumed, false)
             } else {
                 // The title includes channel and, for thread sessions, the
@@ -2549,7 +2600,43 @@ pub async fn run_prompt_task(
                 )
                 .await
                 {
-                    Ok(sid) => {
+                    Ok(mut sid) => {
+                        if let Some(durable) = &agent.state.durable {
+                            let binding = match durable.bind_if_absent(scope, &sid) {
+                                Ok(binding) => binding,
+                                Err(error) => {
+                                    send_prompt_result(
+                                        &result_tx,
+                                        &turn_id,
+                                        agent,
+                                        source,
+                                        PromptOutcome::Error(AcpError::ServeUnavailable(
+                                            error.to_string(),
+                                        )),
+                                        None,
+                                    );
+                                    return;
+                                }
+                            };
+                            if binding.session_id != sid {
+                                if let Err(error) = agent
+                                    .acp
+                                    .session_load(&binding.session_id, &ctx.cwd, vec![])
+                                    .await
+                                {
+                                    send_prompt_result(
+                                        &result_tx,
+                                        &turn_id,
+                                        agent,
+                                        source,
+                                        PromptOutcome::Error(error),
+                                        None,
+                                    );
+                                    return;
+                                }
+                                sid = binding.session_id;
+                            }
+                        }
                         tracing::info!(
                             target: "pool::session",
                             "created session {sid} for channel {cid} (scope {})",
@@ -3067,6 +3154,32 @@ pub async fn run_prompt_task(
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
     // (control_rx=None) take the simple await path — they are not controllable.
     //
+    if agent.acp.is_serve() {
+        use sha2::{Digest, Sha256};
+        let mut ids = reaction_ids.clone();
+        ids.sort();
+        let key = format!("buzz:{}", hex::encode(Sha256::digest(ids.join(":"))));
+        match (&agent.state.durable, &source) {
+            (Some(state), PromptSource::Channel(scope)) => {
+                agent
+                    .acp
+                    .prepare_request(key, state.clone(), scope.clone(), reaction_ids.clone())
+            }
+            _ => {
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(AcpError::ServeUnavailable(
+                        "durable event context missing".into(),
+                    )),
+                    None,
+                );
+                return;
+            }
+        }
+    }
     let prompt_result = match control_rx {
         None => {
             // Heartbeat / non-cancellable path.
@@ -3116,9 +3229,10 @@ pub async fn run_prompt_task(
                         {
                             Ok(stop_reason) => {
                                 log_stop_reason(&source, &stop_reason);
-                                agent.state.invalidate(&source);
-                                let retry_batch =
-                                    requeue_cancelled_batch(&ctx, control_signal, batch);
+                                let retry_batch = if agent.acp.is_serve() { None } else {
+                                    agent.state.invalidate(&source);
+                                    requeue_cancelled_batch(&ctx, control_signal, batch)
+                                };
 
                                 let usage = agent.acp.take_turn_usage();
                                 publish_agent_turn_metric(
@@ -3138,6 +3252,10 @@ pub async fn run_prompt_task(
                                     PromptOutcome::Cancelled,
                                     retry_batch,
                                 );
+                                return;
+                            }
+                            Err(error) if agent.acp.is_serve() => {
+                                send_prompt_result(&result_tx, &turn_id, agent, source, PromptOutcome::Error(error), None);
                                 return;
                             }
                             Err(error) => {
@@ -3451,6 +3569,22 @@ pub async fn run_prompt_task(
                 source,
                 PromptOutcome::Timeout(TimeoutKind::Hard { recently_active }),
                 requeue_batch_if_queue(&ctx, batch),
+            );
+        }
+        Err(
+            error @ (AcpError::ServeUnavailable(_)
+            | AcpError::SubmissionUncertain(_)
+            | AcpError::RemoteTurnFailed(_)),
+        ) => {
+            // A disconnected client is not a dead agent. Retain the binding and journal;
+            // reconciliation owns recovery, never ACP's cancel/respawn/replay path.
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::Error(error),
+                None,
             );
         }
         Err(e) => {
@@ -3966,8 +4100,21 @@ async fn try_resume_session(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
     scope: &SessionScope,
-) -> Option<String> {
-    let stored = agent.state.store.get(scope)?.clone();
+) -> Result<Option<String>, AcpError> {
+    let stored = if let Some(durable) = &agent.state.durable {
+        durable
+            .binding(scope)
+            .map_err(|e| AcpError::ServeUnavailable(e.to_string()))?
+            .map(|binding| crate::session_store::StoredSession {
+                id: binding.session_id,
+                primed: binding.primed,
+            })
+    } else {
+        agent.state.store.get(scope).cloned()
+    };
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
     let session_id = stored.id;
     match agent
         .acp
@@ -3980,7 +4127,10 @@ async fn try_resume_session(
                 "resumed session {session_id} across restart (scope {})",
                 scope.telemetry_label()
             );
-            agent.state.sessions.insert(scope.clone(), session_id.clone());
+            agent
+                .state
+                .sessions
+                .insert(scope.clone(), session_id.clone());
             // Carry forward whether this session already holds its standing
             // context. Defaulting the whole delivery state re-sent <base> on
             // every restart, which showed up as a repeated header in the client.
@@ -3991,8 +4141,9 @@ async fn try_resume_session(
                     ..Default::default()
                 },
             );
-            Some(session_id)
+            Ok(Some(session_id))
         }
+        Err(err) if agent.acp.is_serve() => Err(err),
         Err(err) => {
             tracing::info!(
                 target: "pool::session",
@@ -4000,7 +4151,7 @@ async fn try_resume_session(
                 scope.telemetry_label()
             );
             agent.state.store.remove(scope);
-            None
+            Ok(None)
         }
     }
 }
@@ -6990,7 +7141,7 @@ done"#
             .expect("spawn lifecycle ACP script");
         let mut agent = OwnedAgent {
             index: 0,
-            acp,
+            acp: acp.into(),
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
@@ -7090,7 +7241,7 @@ done"#
         let channel_id = Uuid::new_v4();
         let mut agent = OwnedAgent {
             index: 0,
-            acp,
+            acp: acp.into(),
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
@@ -7277,7 +7428,7 @@ done"#
         };
         let mut agent = OwnedAgent {
             index: 0,
-            acp,
+            acp: acp.into(),
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
@@ -7485,7 +7636,7 @@ done"#
             .expect("spawn wire-capture ACP");
         let mut agent = OwnedAgent {
             index: 0,
-            acp,
+            acp: acp.into(),
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
@@ -7639,7 +7790,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             .expect("spawn wire-capture ACP");
         let mut agent = OwnedAgent {
             index: 0,
-            acp,
+            acp: acp.into(),
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
@@ -8348,7 +8499,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             .expect("spawn dummy ACP");
         let mut agent = OwnedAgent {
             index: 0,
-            acp,
+            acp: acp.into(),
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
@@ -8430,7 +8581,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             .expect("spawn dummy ACP");
         let mut agent = OwnedAgent {
             index,
-            acp,
+            acp: acp.into(),
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
@@ -9486,7 +9637,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         .expect("failed to spawn test agent");
         let mut agent = OwnedAgent {
             index: 0,
-            acp,
+            acp: acp.into(),
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
@@ -9547,7 +9698,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         .expect("failed to spawn test agent");
         let agent = OwnedAgent {
             index: 0,
-            acp,
+            acp: acp.into(),
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
@@ -10662,7 +10813,7 @@ done"#
             .expect("spawn wire-capture ACP");
         let agent = OwnedAgent {
             index: 0,
-            acp,
+            acp: acp.into(),
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
@@ -11056,7 +11207,7 @@ mod startup_effort_tests {
     fn effort_agent(acp: AcpClient, startup_effort: Option<&str>) -> OwnedAgent {
         OwnedAgent {
             index: 0,
-            acp,
+            acp: acp.into(),
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
@@ -11316,7 +11467,7 @@ mod model_switch_tests {
     fn switching_agent(acp: AcpClient, desired_model: &str) -> OwnedAgent {
         OwnedAgent {
             index: 0,
-            acp,
+            acp: acp.into(),
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: Some(desired_model.to_string()),
@@ -11891,7 +12042,7 @@ done"#
     ) -> OwnedAgent {
         OwnedAgent {
             index: 0,
-            acp,
+            acp: acp.into(),
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: Some(desired_model.to_string()),

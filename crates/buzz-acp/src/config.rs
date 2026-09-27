@@ -243,6 +243,22 @@ pub struct AuthenticateArgs {
     about = "ACP harness that bridges Buzz events to AI agents"
 )]
 pub struct CliArgs {
+    /// Connect to Hermes Serve instead of spawning ACP workers.
+    #[arg(long, requires = "serve_profile")]
+    pub serve_url: Option<String>,
+    /// Profile on the shared Hermes Serve instance.
+    #[arg(long, requires = "serve_url")]
+    pub serve_profile: Option<String>,
+    /// Legacy ungated Serve session token (never written to logs).
+    #[arg(long, env = "BUZZ_SERVE_TOKEN", hide_env_values = true)]
+    pub serve_token: Option<String>,
+    /// Private native access/refresh credential JSON for a gated Serve endpoint.
+    #[arg(long, requires = "serve_url", conflicts_with = "serve_token")]
+    pub serve_credentials: Option<PathBuf>,
+    /// Durable bridge database. Required for the Serve backend.
+    #[arg(long, requires = "serve_url")]
+    pub bridge_state: Option<PathBuf>,
+
     #[arg(long, env = "BUZZ_RELAY_URL", default_value = "ws://localhost:3000")]
     pub relay_url: String,
 
@@ -294,7 +310,7 @@ pub struct CliArgs {
     )]
     pub system_prompt_file: Option<PathBuf>,
 
-    /// Number of parallel agent subprocesses.
+    /// Number of parallel ACP subprocesses or Serve connection handles.
     #[arg(long, env = "BUZZ_ACP_AGENTS", default_value_t = 1,
           value_parser = clap::value_parser!(u32).range(1..=32))]
     pub agents: u32,
@@ -437,12 +453,12 @@ pub struct CliArgs {
     )]
     pub base_prompt_file: Option<PathBuf>,
 
-    /// Desired LLM model ID. Applied to every new ACP session after creation.
+    /// Desired LLM model ID. Applied to new ACP or Serve sessions.
     /// Use `buzz-acp models` to discover available model IDs.
     #[arg(long, env = "BUZZ_ACP_MODEL")]
     pub model: Option<String>,
 
-    /// Persisted effort level value (e.g. "high", "medium", "low") to apply via
+    /// Reasoning effort for new Serve sessions, or persisted ACP effort to apply via
     /// `session/set_config_option` at the first session creation. The configId is
     /// resolved from the adapter's advertised `thought_level` capability — not
     /// hardcoded. Non-fatal: if the adapter does not advertise `thought_level`,
@@ -538,6 +554,8 @@ pub struct ChannelFilter {
 
 #[derive(Debug)]
 pub struct Config {
+    pub serve: Option<crate::hermes_serve::ServeConfig>,
+    pub bridge_state: Option<PathBuf>,
     pub keys: Keys,
     pub relay_url: String,
     pub agent_command: String,
@@ -918,6 +936,25 @@ pub fn propagate_legacy_env_vars() {
 }
 
 impl Config {
+    pub(crate) fn open_bridge_state(
+        &self,
+    ) -> anyhow::Result<Option<crate::bridge_state::BridgeState>> {
+        anyhow::ensure!(
+            self.serve.is_some() || self.bridge_state.is_none(),
+            "durable bridge state currently requires Serve"
+        );
+        self.bridge_state
+            .as_deref()
+            .map(|path| {
+                crate::bridge_state::BridgeState::open(
+                    path,
+                    &self.relay_url,
+                    &self.keys.public_key().to_hex(),
+                )
+            })
+            .transpose()
+    }
+
     pub fn from_cli() -> Result<Self, ConfigError> {
         // Legacy env-var propagation is intentionally NOT done here.
         // Call `propagate_legacy_env_vars()` before the tokio runtime starts
@@ -1150,7 +1187,59 @@ impl Config {
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
+        let serve = if let Some(url) = args.serve_url {
+            let parsed = Url::parse(&url)
+                .map_err(|_| ConfigError::ConfigFile("invalid --serve-url".into()))?;
+            if !matches!(parsed.scheme(), "ws" | "wss")
+                || parsed.query().is_some()
+                || parsed.password().is_some()
+                || !parsed.username().is_empty()
+            {
+                return Err(ConfigError::ConfigFile(
+                    "--serve-url must be a ws/wss endpoint without embedded credentials or query"
+                        .into(),
+                ));
+            }
+            if args.bridge_state.is_none()
+                || args
+                    .serve_profile
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+            {
+                return Err(ConfigError::ConfigFile(
+                    "Serve requires --bridge-state and --serve-profile".into(),
+                ));
+            }
+            if !args.mcp_command.is_empty()
+                || !args.permission_mode.is_default()
+                || args.multiple_event_handling != MultipleEventHandling::Queue
+            {
+                return Err(ConfigError::ConfigFile("Serve requires queue mode, default permission mode, and profile-configured MCP servers".into()));
+            }
+            if heartbeat_interval != 0
+                || args.initial_message.is_some()
+                || args.max_turns_per_session != 0
+            {
+                return Err(ConfigError::ConfigFile("Serve initially requires heartbeat disabled, no initial-message, and automatic rotation disabled".into()));
+            }
+            Some(crate::hermes_serve::ServeConfig {
+                url,
+                profile: args.serve_profile.unwrap_or_default(),
+                token: args.serve_token,
+                credentials: args.serve_credentials.map(|path| {
+                    std::sync::Arc::new(crate::serve_auth::ServeCredentials::new(path))
+                }),
+                model: model.clone(),
+                effort: args.effort_level.clone(),
+            })
+        } else {
+            None
+        };
         let config = Config {
+            serve,
+            bridge_state: args.bridge_state,
             keys,
             relay_url: args.relay_url,
             agent_command,
@@ -1228,8 +1317,8 @@ impl Config {
             "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
-            self.agent_command,
-            self.agent_args.join(" "),
+            if self.serve.is_some() { "hermes-serve" } else { &self.agent_command },
+            self.serve.as_ref().map(|serve| format!("profile={}", serve.profile)).unwrap_or_else(|| self.agent_args.join(" ")),
             self.mcp_command,
             self.idle_timeout_secs,
             self.max_turn_duration_secs,
@@ -1535,6 +1624,8 @@ mod tests {
     /// Build a minimal Config for testing without CLI parsing.
     fn test_config(mode: SubscribeMode) -> Config {
         Config {
+            serve: None,
+            bridge_state: None,
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
@@ -3190,3 +3281,7 @@ channels = "ALL"
         );
     }
 }
+
+#[cfg(test)]
+#[path = "config/serve_tests.rs"]
+mod serve_tests;

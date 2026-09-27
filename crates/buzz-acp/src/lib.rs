@@ -1,4 +1,10 @@
 #![deny(unsafe_code)]
+mod backend;
+mod bridge_state;
+mod hermes_serve;
+mod serve_auth;
+mod serve_controls;
+mod serve_recovery;
 
 mod acp;
 mod config;
@@ -24,6 +30,7 @@ use std::time::Duration;
 
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::{ensure, Context, Result};
+use backend::BackendClient;
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
     KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
@@ -1786,7 +1793,9 @@ fn handle_cancel_turn_control(
         return;
     };
 
-    let status = if pool.channel_control_is_ambiguous(channel_id) {
+    let status = if pool.is_server_owned() {
+        "unsupported_use_hermes_controls"
+    } else if pool.channel_control_is_ambiguous(channel_id) {
         "ambiguous_target"
     } else if signal_in_flight_task(pool, channel_id, ControlSignal::Cancel) {
         "sent"
@@ -2045,7 +2054,7 @@ fn any_respawn_in_flight(crash_history: &[SlotCircuit]) -> bool {
 struct RespawnResult {
     index: usize,
     /// Tuple: (initialized client, protocol version, agent name).
-    result: Result<(AcpClient, u32, String)>,
+    result: Result<(BackendClient, u32, String)>,
 }
 
 /// Outcome of a non-cancelling steer attempt, forwarded from a per-attempt
@@ -2092,7 +2101,7 @@ impl RespawnGuard {
     /// Send the result and disarm the guard. Uses `try_send` (sync) so there
     /// is no await boundary between marking `sent` and actually enqueueing —
     /// cancellation cannot slip between the two.
-    fn send(mut self, result: Result<(AcpClient, u32, String)>) {
+    fn send(mut self, result: Result<(BackendClient, u32, String)>) {
         // Invariant: try_send succeeds because the channel capacity equals the
         // slot count, and respawn_in_flight guarantees at most one outstanding
         // result per slot. If this ever fails, the channel sizing or the
@@ -2496,6 +2505,7 @@ async fn tokio_main() -> Result<()> {
         .init();
 
     let mut config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
+    let durable_state = config.open_bridge_state()?;
 
     // ── Setup-mode early branch ───────────────────────────────────────────────
     //
@@ -2552,7 +2562,11 @@ async fn tokio_main() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let startup_watermark = startup_watermark_with_floor(now_unix, config.replay_floor_unix);
+    let initial_watermark = startup_watermark_with_floor(now_unix, config.replay_floor_unix);
+    let startup_watermark = match &durable_state {
+        Some(state) => state.replay_floor(initial_watermark)?,
+        None => initial_watermark,
+    };
     if let Some(floor) = config.replay_floor_unix {
         tracing::info!(
             floor,
@@ -2735,8 +2749,10 @@ async fn tokio_main() -> Result<()> {
 
     let runtime_start_nonce = std::env::var("BUZZ_MANAGED_AGENT_START_NONCE").unwrap_or_default();
     let dedup_mode = config.dedup_mode;
-    let mut queue =
-        EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+    let mut queue = EventQueue::new(dedup_mode)
+        .with_in_flight_deadline(config.max_turn_duration_secs)
+        .with_durable(durable_state.clone());
+    let mut durable_tick = tokio::time::interval(Duration::from_secs(1));
 
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
@@ -2797,7 +2813,11 @@ async fn tokio_main() -> Result<()> {
             .as_deref()
             .and_then(|hex| nostr::PublicKey::from_hex(hex).ok()),
         memory_enabled: config.memory_enabled,
-        harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
+        harness_name: if config.serve.is_some() {
+            "hermes-serve".into()
+        } else {
+            crate::config::normalize_agent_command_identity(&config.agent_command)
+        },
         relay_url: config.relay_url.clone(),
     });
 
@@ -2978,6 +2998,7 @@ async fn tokio_main() -> Result<()> {
         SteerAck(SteerAckEvent),
         Wake(u32, Result<AgentPool, String>),
         HoldDeadline,
+        DurableTick,
     }
 
     loop {
@@ -3037,10 +3058,12 @@ async fn tokio_main() -> Result<()> {
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
                 let has_codex = config.has_generated_codex_config;
+                let serve = config.serve.clone();
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result =
+                        spawn_and_init(serve, &cmd, &args, &env, has_codex, idx, observer).await;
                     guard.send(result);
                 });
             }
@@ -3073,17 +3096,28 @@ async fn tokio_main() -> Result<()> {
                         acp,
                         // A respawn after a crash reopens the SAME map, so the
                         // agent rejoins its threads instead of starting cold.
-                        state: SessionState::with_store(
-                            crate::session_store::SessionStore::open(
-                                &config.keys.public_key().to_hex(),
-                            ),
-                        ),
+                        state: match config.open_bridge_state()? {
+                            Some(state) => SessionState::with_durable(state),
+                            None => {
+                                SessionState::with_store(crate::session_store::SessionStore::open(
+                                    &config.keys.public_key().to_hex(),
+                                ))
+                            }
+                        },
                         model_capabilities: None,
-                        desired_model: config.model.clone(),
+                        desired_model: if config.serve.is_some() {
+                            None
+                        } else {
+                            config.model.clone()
+                        },
                         model_overridden: false,
                         desired_model_request_id: None,
                         desired_model_pending_ack: false,
-                        startup_effort: config.effort_level.clone(),
+                        startup_effort: if config.serve.is_some() {
+                            None
+                        } else {
+                            config.effort_level.clone()
+                        },
                         agent_name,
                         goose_system_prompt_supported: None,
                         protocol_version,
@@ -3131,6 +3165,7 @@ async fn tokio_main() -> Result<()> {
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
                 biased;
+                _ = durable_tick.tick(), if durable_state.is_some() => Some(PoolEvent::DurableTick),
                 // recv() returning None means all senders dropped (pool was torn down).
                 // Break cleanly instead of panicking.
                 r = result_rx.recv(), if pool_ready => match r {
@@ -3351,6 +3386,29 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
+                            // Unsupported controls must never become ordinary model instructions.
+                            if config.serve.is_some()
+                                && owner_cache.get().is_some_and(|owner| buzz_event.event.pubkey.to_hex() == *owner)
+                            {
+                                if let Some(command) = ["!stop", "!rotate", "!shutdown"].into_iter().find(|command|
+                                    is_owner_control_command(&buzz_event.event, kind_u32, command, &pubkey_hex))
+                                {
+                                    if let Some(state) = &durable_state {
+                                        if !state.claim_control(&buzz_event.event.id.to_hex())? { continue; }
+                                    }
+                                    tracing::error!(%command, event_id = %buzz_event.event.id,
+                                        "Serve control unsupported; use Hermes Desktop stop/reset; agent work unchanged");
+                                    if let Some(observer) = &observer {
+                                        observer.emit("control_result", None,
+                                            &observer::ObserverContext::default(),
+                                            serde_json::json!({"type":command, "status":"unsupported_use_hermes_controls",
+                                                "channelId":buzz_event.channel_id.to_string(),
+                                                "requestId":buzz_event.event.id.to_hex()}));
+                                    }
+                                    continue;
+                                }
+                            }
+
                             // Check: kind:9, content "!shutdown", from owner, mentions THIS agent.
                             let is_shutdown = is_owner_control_command(
                                 &buzz_event.event,
@@ -3362,6 +3420,9 @@ async fn tokio_main() -> Result<()> {
                                 let owner = owner_cache.get();
                                 if let Some(owner) = owner {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
+                                        if let Some(state) = &durable_state {
+                                            if !state.claim_control(&buzz_event.event.id.to_hex())? { continue; }
+                                        }
                                         tracing::info!(
                                             channel_id = %buzz_event.channel_id,
                                             sender = %buzz_event.event.pubkey.to_hex(),
@@ -3407,12 +3468,16 @@ async fn tokio_main() -> Result<()> {
                                             .await,
                                         &buzz_event.event,
                                     );
+                                    if let Some(state) = &durable_state {
+                                        if !serve_controls::record_cancel(state, &scope, &buzz_event.event.id.to_hex(), observer.as_ref())? { continue; }
+                                    }
+                                    queue.cancel_durable_pending(&scope)?;
                                     let fired = signal_in_flight_task_for_scope(
                                         &mut pool,
                                         &scope,
                                         ControlSignal::Cancel,
                                     );
-                                    if !fired {
+                                    if !fired && config.serve.is_none() {
                                         tracing::warn!(
                                             channel_id = %buzz_event.channel_id,
                                             scope = %scope.telemetry_label(),
@@ -3447,6 +3512,9 @@ async fn tokio_main() -> Result<()> {
                                     buzz_event.event.pubkey.to_hex() == *owner
                                 });
                                 if from_owner {
+                                    if let Some(state) = &durable_state {
+                                        if !state.claim_control(&buzz_event.event.id.to_hex())? { continue; }
+                                    }
                                     // Scope-exact: rotate only the thread the
                                     // owner's !rotate belongs to. Under the
                                     // default channel policy the scope is the
@@ -4002,6 +4070,20 @@ async fn tokio_main() -> Result<()> {
                             "failed",
                             Some(&error),
                         );
+                    }
+                }
+            }
+            Some(PoolEvent::DurableTick) => {
+                queue.refill_durable(&subscribed_channel_ids)?;
+                if pool_ready {
+                    for (scope, thread_tags) in dispatch_pending(
+                        &mut pool,
+                        &mut queue,
+                        &ctx,
+                        &mut last_activity,
+                        observer.as_ref(),
+                    ) {
+                        typing_channels.insert(scope, thread_tags);
                     }
                 }
             }
@@ -5158,12 +5240,13 @@ fn recover_panicked_agent(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let serve = config.serve.clone();
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(serve, &cmd, &args, &env, has_codex, i, observer).await;
         guard.send(result);
     });
 }
@@ -5399,6 +5482,7 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let serve = config.serve.clone();
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -5410,7 +5494,7 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(serve, &cmd, &args, &env, has_codex, index, observer).await;
         guard.send(result);
     });
 
@@ -5449,6 +5533,9 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
 }
 
 struct PoolStartup {
+    durable_path: Option<std::path::PathBuf>,
+    community: String,
+    serve: Option<hermes_serve::ServeConfig>,
     agents: u32,
     /// Identity of this bot. The persisted session map is keyed on it, so two
     /// bots on one host can never resume into each other's sessions.
@@ -5465,6 +5552,9 @@ struct PoolStartup {
 impl PoolStartup {
     fn from_config(config: &Config, observer: Option<observer::ObserverHandle>) -> Self {
         Self {
+            durable_path: config.bridge_state.clone(),
+            community: config.relay_url.clone(),
+            serve: config.serve.clone(),
             agents: config.agents,
             pubkey_hex: config.keys.public_key().to_hex(),
             command: config.agent_command.clone(),
@@ -5482,11 +5572,17 @@ async fn initialize_agent_pool(
     startup: &PoolStartup,
     mut shutdown: Option<watch::Receiver<()>>,
 ) -> Result<AgentPool> {
+    let durable = startup
+        .durable_path
+        .as_deref()
+        .map(|path| bridge_state::BridgeState::open(path, &startup.community, &startup.pubkey_hex))
+        .transpose()?;
     // One agent failing to start must not kill the whole pool.
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
-        let spawn_result = AcpClient::spawn(
+        let spawn_result = BackendClient::connect(
+            startup.serve.clone(),
             &startup.command,
             &startup.args,
             &startup.extra_env,
@@ -5513,7 +5609,7 @@ async fn initialize_agent_pool(
                     Ok(Ok(init_result)) => {
                         tracing::info!(agent = i, "agent initialized: {init_result}");
                         let protocol_version =
-                            init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
+                            init_result["protocolVersion"].as_u64().unwrap_or(0) as u32;
                         tracing::info!(
                             agent = i,
                             name = init_result
@@ -5536,15 +5632,26 @@ async fn initialize_agent_pool(
                         agent_slots.push(Some(OwnedAgent {
                             index: i,
                             acp,
-                            state: SessionState::with_store(
-                                crate::session_store::SessionStore::open(&startup.pubkey_hex),
-                            ),
+                            state: match durable.clone() {
+                                Some(state) => SessionState::with_durable(state),
+                                None => SessionState::with_store(
+                                    crate::session_store::SessionStore::open(&startup.pubkey_hex),
+                                ),
+                            },
                             model_capabilities: None,
-                            desired_model: startup.model.clone(),
+                            desired_model: if startup.serve.is_some() {
+                                None
+                            } else {
+                                startup.model.clone()
+                            },
                             model_overridden: false,
                             desired_model_request_id: None,
                             desired_model_pending_ack: false,
-                            startup_effort: startup.effort_level.clone(),
+                            startup_effort: if startup.serve.is_some() {
+                                None
+                            } else {
+                                startup.effort_level.clone()
+                            },
                             agent_name,
                             goose_system_prompt_supported: None,
                             protocol_version,
@@ -5583,7 +5690,13 @@ async fn initialize_agent_pool(
         );
     }
     tracing::info!("agent_pool_ready agents={}", live_count);
-    Ok(AgentPool::from_slots(agent_slots))
+    let mut pool = AgentPool::from_slots(agent_slots);
+    if let (Some(config), Some(state)) = (startup.serve.clone(), durable) {
+        let mut recovery = hermes_serve::ServeClient::connect(config.clone()).await?;
+        serve_recovery::reconcile(&mut recovery, &state).await?;
+        pool.recovery_task = Some(serve_recovery::start(config, state));
+    }
+    Ok(pool)
 }
 
 // ── spawn_and_init ────────────────────────────────────────────────────────────
@@ -5592,22 +5705,24 @@ async fn initialize_agent_pool(
 /// Takes owned args so it can run in a background `tokio::spawn` task without
 /// borrowing `Config`. All respawn/refill paths use this.
 async fn spawn_and_init(
+    serve: Option<hermes_serve::ServeConfig>,
     command: &str,
     args: &[String],
     extra_env: &[(String, String)],
     has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
-) -> Result<(AcpClient, u32, String)> {
-    let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
+) -> Result<(BackendClient, u32, String)> {
+    let mut acp =
+        BackendClient::connect(serve, command, args, extra_env, has_generated_codex_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
 
     match acp.initialize().await {
         Ok(init_result) => {
             tracing::info!("agent initialized: {init_result}");
-            let protocol_version = init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
+            let protocol_version = init_result["protocolVersion"].as_u64().unwrap_or(0) as u32;
             acp.observe(
                 "agent_initialized",
                 serde_json::json!({
@@ -9144,6 +9259,8 @@ mod build_mcp_servers_tests {
 
     fn test_config() -> Config {
         Config {
+            serve: None,
+            bridge_state: None,
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
@@ -9367,6 +9484,8 @@ mod error_outcome_emission_tests {
 
     fn test_config() -> Config {
         Config {
+            serve: None,
+            bridge_state: None,
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             // `true` exits cleanly, so the async respawn fails fast and
@@ -9442,7 +9561,8 @@ mod error_outcome_emission_tests {
             index,
             acp: AcpClient::spawn("cat", &[], &[], false)
                 .await
-                .expect("spawn cat as inert agent"),
+                .expect("spawn cat as inert agent")
+                .into(),
             state: Default::default(),
             model_capabilities: None,
             desired_model: None,

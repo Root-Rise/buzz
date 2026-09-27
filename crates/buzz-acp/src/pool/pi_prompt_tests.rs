@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 fn owned_pi(acp: AcpClient, protocol_version: u32) -> OwnedAgent {
     OwnedAgent {
         index: 0,
-        acp,
+        acp: acp.into(),
         state: SessionState::default(),
         model_capabilities: None,
         desired_model: None,
@@ -315,7 +315,8 @@ async fn real_pi_preserves_buzz_prompt_and_launch_skills_on_restore() {
             agent.acp.shutdown().await;
             agent.acp = AcpClient::spawn(path.to_str().unwrap(), &args, &[], false)
                 .await
-                .unwrap();
+                .unwrap()
+                .into();
             agent.acp.initialize().await.unwrap();
         }
         agent
