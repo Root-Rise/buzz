@@ -654,7 +654,10 @@ async fn enforce_ws_admission(
         return false;
     }
 
-    if is_event {
+    // Backport of upstream 5511b56fc: ephemeral activity retains the shared
+    // WebSocket flood gate but must not spend the persisted-message allowance.
+    if matches!(msg, ClientMessage::Event(event) if !buzz_core::kind::is_ephemeral(event.kind.as_u16() as u32))
+    {
         let message_limit = if is_agent {
             limits.agent_standard_messages_per_min
         } else {
@@ -971,3 +974,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "connection_quota_tests.rs"]
+mod quota_tests;
