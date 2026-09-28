@@ -1,4 +1,4 @@
-//! Reattach unattended sessions and reconcile durable requests without replaying work.
+//! Reattach unattended sessions and reconcile exact durable requests against server receipts.
 use crate::{
     bridge_state::BridgeState,
     hermes_serve::{ServeClient, ServeConfig},
@@ -15,15 +15,23 @@ impl Drop for RecoveryTask {
 }
 
 /// One observer per bridge, independent of its busy execution handles.
-pub(crate) fn start(config: ServeConfig, state: BridgeState) -> RecoveryTask {
+pub(crate) fn start(
+    config: ServeConfig,
+    state: BridgeState,
+    activity: crate::serve_activity::ActivityHandle,
+) -> RecoveryTask {
     RecoveryTask(tokio::spawn(async move {
         loop {
+            activity.replace_attachments(HashMap::new());
             match ServeClient::connect(config.clone()).await {
                 Ok(mut client) => {
                     // Reattach all conversations even if no Buzz message arrives after
                     // a Serve restart: reattachment starts the session completion pump.
                     loop {
-                        if let Err(error) = reconcile(&mut client, &state).await {
+                        if let Err(error) =
+                            reconcile_with_activity(&mut client, &state, Some(&activity)).await
+                        {
+                            activity.replace_attachments(HashMap::new());
                             tracing::error!(error=%error,"Serve recovery pending; preserving all durable requests");
                             break;
                         }
@@ -37,12 +45,24 @@ pub(crate) fn start(config: ServeConfig, state: BridgeState) -> RecoveryTask {
     }))
 }
 
-/// Resume every known binding and inspect receipts; never submit model work.
+/// Restore bindings and retry only an exact request whose durable absence is proven.
+#[cfg(test)]
 pub(crate) async fn reconcile(client: &mut ServeClient, state: &BridgeState) -> anyhow::Result<()> {
+    reconcile_with_activity(client, state, None).await
+}
+
+async fn reconcile_with_activity(
+    client: &mut ServeClient,
+    state: &BridgeState,
+    activity: Option<&crate::serve_activity::ActivityHandle>,
+) -> anyhow::Result<()> {
     reconcile_controls(client, state).await?;
     for (scope, binding) in state.all_bindings()? {
         let result = async {
-            client.session_load(&binding.session_id, vec![]).await?;
+            client.ensure_attached(&binding.session_id).await?;
+            if let Some(activity) = activity {
+                activity.replace_attachments(client.attachment_ids());
+            }
             reconcile_scope(client, state, &scope, &binding.session_id).await
         }
         .await;
@@ -111,13 +131,54 @@ async fn reconcile_scope(
         }
     }
     for (key, ids) in requests {
-        let receipt = client.request_status(stored, &key).await?;
+        let mut receipt = client.request_status(stored, &key).await?;
+        if receipt["accepted"].as_bool() == Some(false) && receipt["status"] == "unknown" {
+            anyhow::ensure!(
+                receipt["client_request_id"] == key,
+                "absent receipt identity mismatch"
+            );
+            if state.submission_admission(&key)? != Some(false) {
+                tracing::warn!(request_key=%key,"Absent receipt lacks proof of no prior admission; preserving fence");
+                continue;
+            }
+            let payload = state
+                .submission(&key)?
+                .ok_or_else(|| anyhow::anyhow!("missing frozen request {key}"))?;
+            anyhow::ensure!(
+                payload.as_object().is_some_and(|map| map.len() == 3)
+                    && payload["client_request_id"] == key
+                    && payload["stored_session_id"] == stored,
+                "frozen request identity does not match current binding"
+            );
+            let text = payload["text"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("frozen request text unavailable"))?;
+            anyhow::ensure!(
+                state
+                    .binding(scope)?
+                    .is_some_and(|binding| binding.session_id == stored),
+                "conversation binding changed during recovery"
+            );
+            // A control recorded during the status RPC must be sent before retrying work.
+            if state
+                .pending_controls()?
+                .iter()
+                .any(|control| control.request_keys.contains(&key))
+            {
+                continue;
+            }
+            match client.submit_frozen(stored, &key, text).await {
+                Ok(admission) => receipt = admission,
+                Err(crate::acp::AcpError::AgentError { code: 4091, .. }) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
         let accepted = receipt["accepted"].as_bool() == Some(true);
         if accepted {
+            state.mark_accepted_batch(&ids)?;
             if receipt["status"] == "completed" {
                 state.mark_primed(scope, stored)?;
             }
-            state.mark_accepted_batch(&ids)?;
         }
         let status = match receipt["status"].as_str() {
             Some(status @ ("completed" | "failed" | "cancelled" | "interrupted")) => Some(status),

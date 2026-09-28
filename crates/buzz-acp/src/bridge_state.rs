@@ -76,9 +76,26 @@ impl BridgeState {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).context("create bridge state directory")?;
         }
-        let connection = Connection::open(path).context("open bridge state")?;
+        let mut connection = Connection::open(path).context("open bridge state")?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch(include_str!("bridge_state/schema.sql"))?;
+        // Old journals did not retain prior admission after an uncertain outcome.
+        // NULL preserves that uncertainty; only newly frozen requests start at false.
+        let migration =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let has_admission = migration
+            .prepare("PRAGMA table_info(submissions)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "server_accepted");
+        if !has_admission {
+            migration.execute(
+                "ALTER TABLE submissions ADD COLUMN server_accepted INTEGER",
+                [],
+            )?;
+        }
+        migration.commit()?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             namespace,
@@ -213,6 +230,17 @@ impl BridgeState {
         Ok(())
     }
 
+    /// Compact operator diagnostics without loading any message payloads.
+    pub(crate) fn unfinished_counts(&self) -> Result<std::collections::HashMap<String, u64>> {
+        let conn = self.connection()?;
+        let mut query = conn.prepare(
+            "SELECT status,COUNT(*) FROM inputs WHERE namespace=? AND
+            status IN ('queued','submitting','accepted','uncertain') GROUP BY status",
+        )?;
+        let rows = query.query_map([&self.namespace], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn queued_inputs(&self) -> Result<Vec<(SessionScope, StoredInput)>> {
         let conn = self.connection()?;
         let mut query = conn.prepare(
@@ -303,7 +331,7 @@ impl BridgeState {
             );
         }
         tx.execute(
-            "INSERT INTO submissions(namespace,request_key,payload) VALUES (?,?,?)",
+            "INSERT INTO submissions(namespace,request_key,payload,server_accepted) VALUES (?,?,?,0)",
             params![self.namespace, request_key, serde_json::to_string(payload)?],
         )?;
         tx.commit()?;
@@ -321,6 +349,19 @@ impl BridgeState {
             .optional()?;
         raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into))
             .transpose()
+    }
+
+    /// NULL means the journal predates durable admission evidence and requires review.
+    pub fn submission_admission(&self, request_key: &str) -> Result<Option<bool>> {
+        Ok(self
+            .connection()?
+            .query_row(
+                "SELECT server_accepted FROM submissions WHERE namespace=? AND request_key=?",
+                params![self.namespace, request_key],
+                |row| row.get::<_, Option<bool>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Read the current durable binding, regardless of which worker created it.
@@ -377,6 +418,7 @@ impl BridgeState {
     }
 
     /// Retire only a drained, explicitly selected binding; preserve its generation.
+    #[cfg(test)]
     pub fn retire(&self, scope: &SessionScope, expected_id: &str) -> Result<bool> {
         Ok(self.connection()?.execute(
             "UPDATE bindings SET session_id=NULL,primed=0,generation=generation+1
@@ -408,6 +450,7 @@ impl BridgeState {
     }
 
     /// Only never-submitted inputs are eligible for automatic dispatch after restart.
+    #[cfg(test)]
     pub fn pending(&self, scope: &SessionScope) -> Result<Vec<StoredInput>> {
         self.inputs(scope, Some("queued"))
     }
@@ -441,6 +484,7 @@ impl BridgeState {
     }
 
     /// Commit the correlation key before crossing the network boundary.
+    #[cfg(test)]
     pub fn mark_submitting(&self, event_id: &str, request_key: &str) -> Result<bool> {
         ensure!(!request_key.is_empty(), "empty request key");
         Ok(self.connection()?.execute(
@@ -473,6 +517,13 @@ impl BridgeState {
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for id in event_ids {
+            if status == "accepted" {
+                tx.execute(
+                    "UPDATE submissions SET server_accepted=1 WHERE namespace=?1 AND request_key IN
+                    (SELECT request_key FROM inputs WHERE namespace=?1 AND event_id=?2)",
+                    params![self.namespace, id],
+                )?;
+            }
             let current: String = tx.query_row(
                 "SELECT status FROM inputs WHERE namespace=? AND event_id=?",
                 params![self.namespace, id],
@@ -496,15 +547,26 @@ impl BridgeState {
     }
 
     /// Record positive server admission, including reconciliation after a lost response.
+    #[cfg(test)]
     pub fn mark_accepted(&self, event_id: &str) -> Result<bool> {
-        Ok(self.connection()?.execute(
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE submissions SET server_accepted=1 WHERE namespace=?1 AND request_key IN
+            (SELECT request_key FROM inputs WHERE namespace=?1 AND event_id=?2)",
+            params![self.namespace, event_id],
+        )?;
+        let changed = tx.execute(
             "UPDATE inputs SET status='accepted' WHERE namespace=? AND event_id=?
              AND status IN ('submitting','uncertain')",
             params![self.namespace, event_id],
-        )? == 1)
+        )? == 1;
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// Terminal failures stay visible; uncertain submissions never silently return to queued.
+    #[cfg(test)]
     pub fn finish(&self, event_id: &str, status: &str) -> Result<bool> {
         ensure!(
             [
@@ -525,6 +587,7 @@ impl BridgeState {
     }
 
     /// Import an old JSON map once. Bad input aborts the whole import and remains untouched.
+    #[cfg(test)]
     pub fn import_legacy_json(&self, path: &Path) -> Result<usize> {
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

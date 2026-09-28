@@ -63,6 +63,7 @@ fn serve_config_rejects_unsupported_or_nondurable_execution() {
         |args| args.multiple_event_handling = MultipleEventHandling::Steer,
         |args| args.permission_mode = PermissionMode::BypassPermissions,
         |args| args.heartbeat_interval = 10,
+        |args| args.lazy_pool = true,
         |args| args.initial_message = Some("must not submit".into()),
         |args| args.max_turns_per_session = 2,
     ];

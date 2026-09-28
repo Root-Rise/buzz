@@ -47,7 +47,7 @@ fn restart_never_replays_terminal_or_uncertain_inputs_and_sibling_can_progress()
         let id = event.event.id.to_hex();
         assert!(queue.push(event.clone()));
         state
-            .prepare_submission(&[id.clone()], status, &json!({"text": status}))
+            .prepare_submission(std::slice::from_ref(&id), status, &json!({"text": status}))
             .unwrap();
         state.finish_batch(&[id], status).unwrap();
         previously_submitted.push(event);
@@ -83,7 +83,7 @@ fn restart_never_replays_terminal_or_uncertain_inputs_and_sibling_can_progress()
     let independent_id = independent.event.id.to_hex();
     state
         .prepare_submission(
-            &[independent_id.clone()],
+            std::slice::from_ref(&independent_id),
             "sibling",
             &json!({"text":"independent"}),
         )

@@ -44,14 +44,14 @@ impl PreparedRequest {
     fn record(&self, stored: &str, receipt: &Value) -> Result<(), AcpError> {
         let accepted = receipt["accepted"].as_bool() == Some(true);
         if accepted {
+            self.state
+                .mark_accepted_batch(&self.event_ids)
+                .map_err(journal_error)?;
             if receipt["status"] == "completed" {
                 self.state
                     .mark_primed(&self.scope, stored)
                     .map_err(journal_error)?;
             }
-            self.state
-                .mark_accepted_batch(&self.event_ids)
-                .map_err(journal_error)?;
         }
         let terminal = match receipt["status"].as_str() {
             Some(status @ ("completed" | "failed" | "cancelled" | "interrupted")) => Some(status),
@@ -167,7 +167,12 @@ impl ServeClient {
                                     }
                                 }
                             }
-                            Message::Ping(data) => { if !matches!(tokio::time::timeout(Duration::from_secs(10), sink.send(Message::Pong(data))).await, Ok(Ok(()))) { break; } }
+                            Message::Ping(data) => {
+                                match tokio::time::timeout(Duration::from_secs(10), sink.send(Message::Pong(data))).await {
+                                    Ok(Ok(())) => {},
+                                    _ => break,
+                                }
+                            }
                             Message::Close(_) => break,
                             _ => {}
                         }
@@ -217,10 +222,45 @@ impl ServeClient {
         stored: &str,
         key: &str,
     ) -> Result<Value, AcpError> {
-        self.session_load(stored, vec![]).await?;
+        self.ensure_attached(stored).await?;
         self.rpc(
             "prompt.status",
             json!({"session_id":self.runtime(stored)?,"client_request_id":key}),
+        )
+        .await
+    }
+
+    /// Snapshot for profile-safe activity correlation; transport runtimes are process-unique.
+    pub(crate) fn attachment_ids(&self) -> HashMap<String, String> {
+        self.sessions.clone()
+    }
+
+    /// Observe live state without attaching or starting a turn.
+    pub(crate) async fn active_sessions(&self) -> Result<Value, AcpError> {
+        self.rpc("session.active_list", json!({})).await
+    }
+
+    /// A pool's durable binding can outlive every attachment on this connection.
+    pub(crate) async fn ensure_attached(&mut self, stored: &str) -> Result<(), AcpError> {
+        self.reconnect_if_closed().await?;
+        if !self.sessions.contains_key(stored) {
+            self.session_load(stored, vec![]).await?;
+        }
+        Ok(())
+    }
+
+    /// Retry one already-journaled request; return admission, never wait for its model turn.
+    pub(crate) async fn submit_frozen(
+        &mut self,
+        stored: &str,
+        key: &str,
+        text: &str,
+    ) -> Result<Value, AcpError> {
+        self.ensure_attached(stored).await?;
+        self.rpc(
+            "prompt.submit",
+            json!({"session_id":self.runtime(stored)?,"text":text,
+            "queued":true,"client_request_id":key}),
         )
         .await
     }
@@ -364,8 +404,12 @@ impl ServeClient {
         self.in_flight = Some((stored.into(), key.clone()));
         // Correlation and durable intent precede the first await, so a control
         // arriving during reconnect cannot mistake an unsubmitted turn for success.
-        if self.reconnect_if_closed().await? {
-            self.session_load(stored, vec![]).await?;
+        if let Err(error) = self.ensure_attached(stored).await {
+            self.in_flight = None;
+            if let Some(prepared) = &self.prepared {
+                prepared.finish("uncertain")?;
+            }
+            return Err(AcpError::SubmissionUncertain(error.to_string()));
         }
         let runtime = self.runtime(stored)?.to_owned();
         let deadline = tokio::time::Instant::now() + max_duration;
@@ -419,6 +463,7 @@ impl ServeClient {
                 }
             }
         };
+        self.in_flight = None;
         if let Some(prepared) = &self.prepared {
             match &result {
                 Err(AcpError::SubmissionUncertain(_)) => prepared.finish("uncertain")?,
@@ -426,7 +471,6 @@ impl ServeClient {
                 _ => {}
             }
         }
-        self.in_flight = None;
         result
     }
 
@@ -482,7 +526,7 @@ impl ServeClient {
         stored: &str,
         key: &str,
     ) -> Result<Value, AcpError> {
-        self.session_load(stored, vec![]).await?;
+        self.ensure_attached(stored).await?;
         self.rpc(
             "prompt.cancel",
             json!({"session_id":self.runtime(stored)?,"client_request_id":key}),
@@ -876,6 +920,43 @@ mod tests {
         .await
         .unwrap();
         assert!(!state.scope_blocked(&scope).unwrap());
+        // Simulate a crash after journaling but before the socket sends the request.
+        // Recovery must use the original bytes/key. A late original submission then
+        // races/reuses that same receipt rather than starting another model turn.
+        state
+            .accept_event(&scope, "event-3", &json!({"synthetic":true}))
+            .unwrap();
+        state.prepare_submission(&["event-3".into()], "interop-3", &json!({
+            "stored_session_id":stored,"client_request_id":"interop-3","text":"interop recovered"
+        })).unwrap();
+        state
+            .finish_batch(&["event-3".into()], "uncertain")
+            .unwrap();
+        crate::serve_recovery::reconcile(&mut client, &state)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.submission_admission("interop-3").unwrap(),
+            Some(true),
+            "recovery itself must obtain admission before the late original submits"
+        );
+        let mut delayed = ServeClient::connect(client.config.clone()).await.unwrap();
+        delayed.request_key = Some("interop-3".into());
+        delayed.prepared = Some(PreparedRequest {
+            state: state.clone(),
+            scope: scope.clone(),
+            event_ids: vec!["event-3".into()],
+        });
+        // Deliberately do not call session_load: a fresh transport must attach here.
+        assert_eq!(
+            delayed
+                .prompt(&stored, &["interop recovered"], Duration::from_secs(15))
+                .await
+                .unwrap(),
+            StopReason::EndTurn
+        );
+        assert_eq!(state.inputs(&scope, None).unwrap()[2].status, "completed");
+        drop(delayed);
         // Cancellation may win the race against a delayed submission on another
         // socket. Its durable tombstone must reject later execution of that key.
         let receipt = client
@@ -893,3 +974,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "hermes_serve/recovery_tests.rs"]
+mod recovery_tests;

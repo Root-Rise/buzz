@@ -1218,6 +1218,9 @@ impl Config {
             {
                 return Err(ConfigError::ConfigFile("Serve requires queue mode, default permission mode, and profile-configured MCP servers".into()));
             }
+            if args.lazy_pool {
+                return Err(ConfigError::ConfigFile("Serve requires an always-connected bridge; lazy-pool would suspend unattended recovery and activity observation".into()));
+            }
             if heartbeat_interval != 0
                 || args.initial_message.is_some()
                 || args.max_turns_per_session != 0

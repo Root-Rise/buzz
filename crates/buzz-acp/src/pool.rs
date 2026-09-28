@@ -396,6 +396,7 @@ impl OwnedAgent {
 /// tasks for panic recovery.
 pub struct AgentPool {
     pub(crate) recovery_task: Option<crate::serve_recovery::RecoveryTask>,
+    pub(crate) activity: Option<crate::serve_activity::ActivityMonitor>,
     server_owned: bool,
     agents: Vec<Option<OwnedAgent>>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
@@ -911,6 +912,7 @@ impl AgentPool {
         let (result_tx, result_rx) = mpsc::unbounded_channel();
         Self {
             recovery_task: None,
+            activity: None,
             server_owned: slots.iter().flatten().any(|agent| agent.acp.is_serve()),
             agents: slots,
             result_tx,
@@ -2347,23 +2349,32 @@ pub async fn run_prompt_task(
         .as_ref()
         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
         .unwrap_or_default();
-    agent.acp.observe(
-        "turn_started",
-        serde_json::json!({
-            "source": match &source {
-                PromptSource::Channel(_) => "channel",
-                PromptSource::Heartbeat => "heartbeat",
-            },
-            "triggeringEventIds": triggering_event_ids,
-        }),
-    );
+    // Serve activity comes from server observation, including autonomous turns.
+    // Dispatch/admission can be queued and must not claim that a model is working.
+    let lifecycle_observer = if agent.acp.is_serve() {
+        None
+    } else {
+        agent.acp.observer_handle()
+    };
+    if !agent.acp.is_serve() {
+        agent.acp.observe(
+            "turn_started",
+            serde_json::json!({
+                "source": match &source {
+                    PromptSource::Channel(_) => "channel",
+                    PromptSource::Heartbeat => "heartbeat",
+                },
+                "triggeringEventIds": triggering_event_ids,
+            }),
+        );
+    }
 
     // Emits `turn_completed` on any exit path. Captures observer handle and
     // metadata now, before the agent is moved into PromptResult. It must be
     // declared before `liveness_guard`: Rust drops locals in reverse order, so
     // liveness is aborted before completion makes the turn terminal.
     let _turn_guard = TurnCompletionGuard::new(
-        agent.acp.observer_handle(),
+        lifecycle_observer.clone(),
         agent.acp.observer_agent_index(),
         observer_channel_id,
         turn_id.clone(),
@@ -2383,7 +2394,7 @@ pub async fn run_prompt_task(
         session_id: None,
     }));
     let liveness = run_turn_liveness(
-        agent.acp.observer_handle(),
+        lifecycle_observer.clone(),
         agent.acp.observer_agent_index(),
         observer::context_for_turn(
             observer_channel_id,

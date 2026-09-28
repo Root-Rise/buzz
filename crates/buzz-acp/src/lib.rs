@@ -2,6 +2,7 @@
 mod backend;
 mod bridge_state;
 mod hermes_serve;
+mod serve_activity;
 mod serve_auth;
 mod serve_controls;
 mod serve_recovery;
@@ -3771,7 +3772,15 @@ async fn tokio_main() -> Result<()> {
                     // Use try_publish (non-blocking) for typing indicators —
                     // they're ephemeral and must not block the main loop during
                     // relay reconnection (#35).
-                    for (scope, thread_tags) in &typing_channels {
+                    let observed_typing: HashMap<_, _> = pool.activity.as_ref().map(|activity| {
+                        activity.working_scopes().into_iter().map(|scope| {
+                            let root = scope.root_event_id().map(str::to_owned);
+                            (scope, ThreadTags { root_event_id: root.clone(), parent_event_id: root, ..Default::default() })
+                        }).collect()
+                    }).unwrap_or_default();
+                    let typing = if pool.is_server_owned() { &observed_typing } else { &typing_channels };
+                    for (scope, thread_tags) in typing {
+                        if removed_channels.contains(&scope.channel_id()) { continue; }
                         let ch = scope.channel_id();
                         if let Ok(event) = relay.build_typing_event(
                             ch,
@@ -5692,9 +5701,13 @@ async fn initialize_agent_pool(
     tracing::info!("agent_pool_ready agents={}", live_count);
     let mut pool = AgentPool::from_slots(agent_slots);
     if let (Some(config), Some(state)) = (startup.serve.clone(), durable) {
-        let mut recovery = hermes_serve::ServeClient::connect(config.clone()).await?;
-        serve_recovery::reconcile(&mut recovery, &state).await?;
-        pool.recovery_task = Some(serve_recovery::start(config, state));
+        let activity = serve_activity::ActivityMonitor::start(
+            config.clone(),
+            state.clone(),
+            startup.observer.clone(),
+        );
+        pool.recovery_task = Some(serve_recovery::start(config, state, activity.handle()));
+        pool.activity = Some(activity);
     }
     Ok(pool)
 }

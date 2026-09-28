@@ -11,7 +11,7 @@ PRAGMA journal_mode=WAL;
                UNIQUE(namespace,event_id));
              CREATE INDEX IF NOT EXISTS inputs_pending ON inputs(namespace,scope,status,sequence);
              CREATE TABLE IF NOT EXISTS submissions (
-               namespace TEXT NOT NULL, request_key TEXT NOT NULL, payload TEXT NOT NULL,
+               namespace TEXT NOT NULL, request_key TEXT NOT NULL, payload TEXT NOT NULL, server_accepted INTEGER,
                PRIMARY KEY(namespace,request_key));
              CREATE TABLE IF NOT EXISTS relay_progress (
                namespace TEXT PRIMARY KEY, replay_floor INTEGER NOT NULL);

@@ -148,3 +148,36 @@ fn submission_payload_and_batch_transitions_are_atomic() -> Result<()> {
     assert!(store.pending(&scope)?.is_empty());
     Ok(())
 }
+
+#[test]
+fn legacy_admission_is_unknown_and_confirmed_admission_survives_uncertain_restart() -> Result<()> {
+    let (path, key, scope) = fixture();
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let namespace = serde_json::to_string(&("https://test.example", &key))?;
+    let legacy = Connection::open(&path)?;
+    legacy.execute_batch(
+        "CREATE TABLE submissions(namespace TEXT NOT NULL, request_key TEXT NOT NULL,
+        payload TEXT NOT NULL, PRIMARY KEY(namespace,request_key));",
+    )?;
+    legacy.execute(
+        "INSERT INTO submissions VALUES (?,'legacy','{}')",
+        [&namespace],
+    )?;
+    drop(legacy);
+    let store = BridgeState::open(&path, "https://test.example", &key)?;
+    assert_eq!(store.submission_admission("legacy")?, None);
+    store.accept_event(&scope, "new", &json!({"text":"new"}))?;
+    let payload =
+        json!({"text":"exact", "client_request_id":"request", "stored_session_id":"stored"});
+    store.prepare_submission(&["new".into()], "request", &payload)?;
+    assert_eq!(store.submission_admission("request")?, Some(false));
+    store.mark_accepted_batch(&["new".into()])?;
+    store.finish_batch(&["new".into()], "uncertain")?;
+    // Retrying prepare must not erase proof that the server accepted this identity.
+    store.prepare_submission(&["new".into()], "request", &payload)?;
+    drop(store);
+    let reopened = BridgeState::open(&path, "https://test.example", &key)?;
+    assert_eq!(reopened.submission_admission("request")?, Some(true));
+    assert_eq!(reopened.submission_admission("legacy")?, None);
+    Ok(())
+}

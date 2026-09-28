@@ -81,9 +81,13 @@ impl SessionStore {
 
     /// Open a store at an explicit path. Tests use this: sharing a process-wide
     /// env var makes them race, since `set_var` in one races `remove_var` in another.
+    #[cfg(test)]
     pub fn open_at(path: PathBuf) -> Self {
         let entries = Self::read(&path).unwrap_or_default();
-        Self { path: Some(path), entries }
+        Self {
+            path: Some(path),
+            entries,
+        }
     }
 
     fn resolve_path(pubkey_hex: &str) -> Option<PathBuf> {
@@ -96,7 +100,7 @@ impl SessionStore {
         };
         // A short pubkey prefix is enough to separate co-hosted agents and keeps
         // the path readable for a human during an incident.
-        let dir = base.join(&pubkey_hex.get(..16).unwrap_or(pubkey_hex));
+        let dir = base.join(pubkey_hex.get(..16).unwrap_or(pubkey_hex));
         if let Err(err) = std::fs::create_dir_all(&dir) {
             tracing::debug!(target: "acp::store", "cannot create {}: {err}", dir.display());
             return None;
@@ -203,7 +207,10 @@ mod tests {
     use uuid::Uuid;
 
     fn thread(root: &str) -> SessionScope {
-        SessionScope::Thread { channel_id: Uuid::nil(), root_event_id: root.to_owned() }
+        SessionScope::Thread {
+            channel_id: Uuid::nil(),
+            root_event_id: root.to_owned(),
+        }
     }
 
     /// Each test gets its own file, so these run in parallel without a shared env var.
@@ -219,7 +226,12 @@ mod tests {
         let mut store = SessionStore::open_at(path.clone());
         store.insert(&thread("aa"), "sess-1");
         // A restart is exactly this: a new store over the same path.
-        assert_eq!(SessionStore::open_at(path).get(&thread("aa")).map(|e| e.id.as_str()), Some("sess-1"));
+        assert_eq!(
+            SessionStore::open_at(path)
+                .get(&thread("aa"))
+                .map(|e| e.id.as_str()),
+            Some("sess-1")
+        );
     }
 
     #[test]
@@ -228,12 +240,27 @@ mod tests {
         let mut store = SessionStore::open_at(path.clone());
         store.insert(&thread("aa"), "sess-a");
         store.insert(&thread("bb"), "sess-b");
-        store.insert(&SessionScope::Conversation { channel_id: Uuid::nil() }, "sess-conv");
+        store.insert(
+            &SessionScope::Conversation {
+                channel_id: Uuid::nil(),
+            },
+            "sess-conv",
+        );
         let reopened = SessionStore::open_at(path);
-        assert_eq!(reopened.get(&thread("aa")).map(|e| e.id.as_str()), Some("sess-a"));
-        assert_eq!(reopened.get(&thread("bb")).map(|e| e.id.as_str()), Some("sess-b"));
         assert_eq!(
-            reopened.get(&SessionScope::Conversation { channel_id: Uuid::nil() }).map(|e| e.id.as_str()),
+            reopened.get(&thread("aa")).map(|e| e.id.as_str()),
+            Some("sess-a")
+        );
+        assert_eq!(
+            reopened.get(&thread("bb")).map(|e| e.id.as_str()),
+            Some("sess-b")
+        );
+        assert_eq!(
+            reopened
+                .get(&SessionScope::Conversation {
+                    channel_id: Uuid::nil()
+                })
+                .map(|e| e.id.as_str()),
             Some("sess-conv")
         );
     }
@@ -243,7 +270,9 @@ mod tests {
         let mut a = SessionStore::open_at(temp_store_path());
         a.insert(&thread("x"), "sess-a");
         assert_eq!(
-            SessionStore::open_at(temp_store_path()).get(&thread("x")).map(|e| e.id.as_str()),
+            SessionStore::open_at(temp_store_path())
+                .get(&thread("x"))
+                .map(|e| e.id.as_str()),
             None,
             "one agent must not see another's sessions"
         );
@@ -255,7 +284,12 @@ mod tests {
         let mut store = SessionStore::open_at(path.clone());
         store.insert(&thread("aa"), "sess-1");
         store.remove(&thread("aa"));
-        assert_eq!(SessionStore::open_at(path).get(&thread("aa")).map(|e| e.id.as_str()), None);
+        assert_eq!(
+            SessionStore::open_at(path)
+                .get(&thread("aa"))
+                .map(|e| e.id.as_str()),
+            None
+        );
     }
 
     #[test]
@@ -274,20 +308,30 @@ mod tests {
     fn a_corrupt_file_degrades_to_empty_rather_than_failing() {
         let path = temp_store_path();
         std::fs::write(&path, "{ this is not json").unwrap();
-        assert_eq!(SessionStore::open_at(path).get(&thread("aa")).map(|e| e.id.as_str()), None);
+        assert_eq!(
+            SessionStore::open_at(path)
+                .get(&thread("aa"))
+                .map(|e| e.id.as_str()),
+            None
+        );
     }
 
     #[test]
     fn an_unwritable_location_never_panics() {
         let mut store = SessionStore::open_at(PathBuf::from("/proc/nope/sessions.json"));
         store.insert(&thread("aa"), "sess-1"); // must not panic
-        assert_eq!(store.get(&thread("aa")).map(|e| e.id.as_str()), Some("sess-1")); // in memory for this run
+        assert_eq!(
+            store.get(&thread("aa")).map(|e| e.id.as_str()),
+            Some("sess-1")
+        ); // in memory for this run
     }
 
     #[test]
     fn keys_are_greppable_and_distinct() {
         assert_eq!(
-            scope_key(&SessionScope::Conversation { channel_id: Uuid::nil() }),
+            scope_key(&SessionScope::Conversation {
+                channel_id: Uuid::nil()
+            }),
             "conversation:00000000-0000-0000-0000-000000000000"
         );
         assert!(scope_key(&thread("beef")).starts_with("thread:"));
@@ -302,10 +346,18 @@ mod tests {
         let path = temp_store_path();
         let mut store = SessionStore::open_at(path.clone());
         store.insert(&thread("aa"), "sess-1");
-        assert!(!store.get(&thread("aa")).unwrap().primed, "new sessions start unprimed");
+        assert!(
+            !store.get(&thread("aa")).unwrap().primed,
+            "new sessions start unprimed"
+        );
 
         store.mark_primed(&thread("aa"), "sess-1");
-        assert!(SessionStore::open_at(path).get(&thread("aa")).unwrap().primed);
+        assert!(
+            SessionStore::open_at(path)
+                .get(&thread("aa"))
+                .unwrap()
+                .primed
+        );
     }
 
     #[test]
@@ -335,9 +387,15 @@ mod tests {
         // standing context wastes tokens; wrongly skipping it strands an agent
         // with no instructions, so the old format must read as NOT primed.
         let path = temp_store_path();
-        std::fs::write(&path, r#"{"thread:00000000-0000-0000-0000-000000000000:aa":"sess-old"}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"thread:00000000-0000-0000-0000-000000000000:aa":"sess-old"}"#,
+        )
+        .unwrap();
         let store = SessionStore::open_at(path);
-        let entry = store.get(&thread("aa")).expect("old format must still load");
+        let entry = store
+            .get(&thread("aa"))
+            .expect("old format must still load");
         assert_eq!(entry.id, "sess-old");
         assert!(!entry.primed);
     }
