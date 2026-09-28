@@ -1203,6 +1203,8 @@ struct BgState {
     /// relay's rate-limit NOTICE does not carry an event ID, so all unresolved
     /// observer writes are moved back ahead of the parked FIFO when one arrives.
     observer_in_flight: VecDeque<Box<Event>>,
+    typing_diagnostics: publish_diagnostics::PublishDiagnostics,
+    observer_diagnostics: publish_diagnostics::PublishDiagnostics,
     /// Frames evicted from the bounded pending/in-flight observer buffers since
     /// summary log. Makes overflow loss visible instead of silent.
     gated_observer_dropped: u64,
@@ -1244,6 +1246,8 @@ impl BgState {
             observer_resub_needed: false,
             gated_observer_pending: VecDeque::new(),
             observer_in_flight: VecDeque::new(),
+            typing_diagnostics: publish_diagnostics::PublishDiagnostics::new("typing"),
+            observer_diagnostics: publish_diagnostics::PublishDiagnostics::new("observer"),
             gated_observer_dropped: 0,
             resubscribe_retry: HashSet::new(),
             connection_generation: 0,
@@ -1668,6 +1672,8 @@ async fn execute_connected_command(
             }
         }
         RelayCommand::PublishEvent { event } => {
+            let sampled_typing = event.kind.as_u16() as u32 == KIND_TYPING_INDICATOR
+                && state.typing_diagnostics.sample();
             // Observer telemetry frames (kind 24200) are durable telemetry, not
             // droppable ephemera: park them while the rate-limit gate is armed —
             // and while earlier parked frames are still draining, so relative
@@ -1694,18 +1700,36 @@ async fn execute_connected_command(
             // kind guard above to avoid silently discarding user data.
             if state.check_rate_gate().is_some() {
                 debug!("rate-gated: dropping ephemeral PublishEvent (typing indicator)");
+                if sampled_typing {
+                    state.typing_diagnostics.dropped(event.id, "rate_gate");
+                }
                 return true;
             }
             // Best-effort: log a send failure but don't trigger reconnect — the
             // next ping or read will detect the dead socket. A failed observer
             // frame is parked so the post-reconnect drain redelivers it.
             let is_observer = event.kind.as_u16() as u32 == KIND_AGENT_OBSERVER_FRAME;
+            let sampled_observer = is_observer && state.observer_diagnostics.sample();
             if send_publish_event_frame(ws, &event).await {
+                if sampled_typing {
+                    state.typing_diagnostics.sent(event.id);
+                }
+                if sampled_observer {
+                    state.observer_diagnostics.sent(event.id);
+                }
                 if is_observer {
                     state.track_observer_in_flight(event);
                 }
-            } else if is_observer {
-                state.park_gated_observer_frame(event);
+            } else {
+                if sampled_typing {
+                    state.typing_diagnostics.write_uncertain(event.id);
+                }
+                if sampled_observer {
+                    state.observer_diagnostics.write_uncertain(event.id);
+                }
+                if is_observer {
+                    state.park_gated_observer_frame(event);
+                }
             }
             true
         }
@@ -2065,6 +2089,8 @@ async fn run_background_task(
                    }
 
                    _ = ping_interval.tick() => {
+                       state.typing_diagnostics.expire();
+                       state.observer_diagnostics.expire();
                        if ping_sent && last_pong.elapsed() > PONG_TIMEOUT {
                            // No pong received after our last ping — connection is dead.
                            warn!("no pong received within {:?} — connection dead, reconnecting", PONG_TIMEOUT);
@@ -2517,6 +2543,12 @@ async fn handle_ws_message(
                     accepted,
                     message,
                 } => {
+                    state
+                        .typing_diagnostics
+                        .acknowledge(&event_id, accepted, &message);
+                    state
+                        .observer_diagnostics
+                        .acknowledge(&event_id, accepted, &message);
                     if !accepted && message.starts_with("auth") {
                         // AUTH OK with accepted=false means auth was rejected.
                         warn!("mid-session AUTH rejected (event {event_id}): {message} — triggering reconnect");
@@ -2819,11 +2851,18 @@ async fn drain_gated_observer_pending(
         let Some(event) = state.gated_observer_pending.pop_front() else {
             break;
         };
+        let sampled = state.observer_diagnostics.sample();
         if !send_publish_event_frame(ws, &event).await {
+            if sampled {
+                state.observer_diagnostics.write_uncertain(event.id);
+            }
             // Socket may be dead — re-park at the front so the frame survives
             // reconnect (the post-reconnect drain will retry it in order).
             state.gated_observer_pending.push_front(event);
             break;
+        }
+        if sampled {
+            state.observer_diagnostics.sent(event.id);
         }
         state.track_observer_in_flight(event);
         sent += 1;
@@ -4173,6 +4212,7 @@ async fn wait_for_any_ok(
     }
 }
 
+mod publish_diagnostics;
 mod recovery;
 
 #[cfg(test)]
