@@ -7,7 +7,7 @@ use crate::{
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -85,6 +85,7 @@ struct Observation {
     handle: Option<ObserverHandle>,
     index: Option<usize>,
     context: ObserverContext,
+    details: Option<Arc<Mutex<crate::serve_observer::ServeObserver>>>,
 }
 
 /// Connection handle with a continuous read pump, including while its pool slot is idle.
@@ -94,6 +95,7 @@ pub struct ServeClient {
     pump: tokio::task::JoinHandle<()>,
     observation: Arc<Mutex<Observation>>,
     sessions: HashMap<String, String>,
+    observed_sessions: HashSet<String>,
     pub(crate) request_key: Option<String>,
     in_flight: Option<(String, String)>,
     pub(crate) prepared: Option<PreparedRequest>,
@@ -163,7 +165,11 @@ impl ServeClient {
                                             let _ = reply.send(result);
                                         }
                                     } else if let Ok(obs) = observed.lock() {
-                                        if let Some(handle) = &obs.handle { handle.emit("hermes_event", obs.index, &obs.context, frame); }
+                                        // Only the profile recovery observer publishes details.
+                                        // Pool sockets can be attached to many unrelated threads.
+                                        if let Some(details) = &obs.details {
+                                            if let Ok(mut details) = details.lock() { details.frame(&frame); }
+                                        }
                                     }
                                 }
                             }
@@ -191,6 +197,7 @@ impl ServeClient {
             pump,
             observation,
             sessions: HashMap::new(),
+            observed_sessions: HashSet::new(),
             request_key: None,
             in_flight: None,
             prepared: None,
@@ -208,6 +215,7 @@ impl ServeClient {
         );
         if let Ok(obs) = self.observation.lock() {
             replacement.set_observer_context(obs.context.clone());
+            replacement.set_activity_observer(obs.details.clone());
         }
         replacement.request_key = self.request_key.take();
         replacement.in_flight = self.in_flight.take();
@@ -292,6 +300,86 @@ impl ServeClient {
             obs.handle = handle;
             obs.index = Some(index);
         }
+    }
+
+    pub(crate) fn set_activity_observer(
+        &mut self,
+        details: Option<Arc<Mutex<crate::serve_observer::ServeObserver>>>,
+    ) {
+        if let Ok(mut obs) = self.observation.lock() {
+            obs.details = details;
+        }
+    }
+
+    /// Subscribe to a bound session's activity, replaying only telemetry (never prompts).
+    pub(crate) async fn observe_session(
+        &mut self,
+        stored: &str,
+        scope: &crate::scope::SessionScope,
+    ) -> anyhow::Result<()> {
+        let details = self
+            .observation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Serve observation lock poisoned"))?
+            .details
+            .clone();
+        let Some(details) = details else {
+            return Ok(());
+        };
+        let runtime = self.runtime(stored)?.to_owned();
+        if self.observed_sessions.contains(stored)
+            && !details
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Serve activity lock poisoned"))?
+                .needs_replay(&runtime)
+        {
+            return Ok(());
+        }
+        let resync = details
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Serve activity lock poisoned"))?
+            .needs_replay(&runtime);
+        let last = details
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Serve activity lock poisoned"))?
+            .begin(&runtime, stored, scope)?;
+        let mut replay = self
+            .rpc(
+                "session.events.since",
+                json!({"session_id":runtime,"last_seen":if resync {0} else {last}}),
+            )
+            .await?;
+        let reset = details
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Serve activity lock poisoned"))?
+            .needs_reset(&runtime, &replay);
+        if reset {
+            replay = self
+                .rpc(
+                    "session.events.since",
+                    json!({"session_id":runtime,"last_seen":0}),
+                )
+                .await?;
+        }
+        anyhow::ensure!(
+            replay["events"].is_array() && replay["epoch"].is_string(),
+            "Invalid Serve event replay"
+        );
+        let count = replay["count"].as_u64().unwrap_or_default();
+        let truncated = replay["truncated"] == true;
+        details
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Serve activity lock poisoned"))?
+            .finish(&runtime, replay, reset);
+        self.observed_sessions.insert(stored.to_owned());
+        tracing::info!(
+            session = stored,
+            count,
+            truncated,
+            reset,
+            "Serve activity stream attached"
+        );
+        Ok(())
     }
     pub(crate) fn set_observer_context(&mut self, context: ObserverContext) {
         if let Ok(mut obs) = self.observation.lock() {

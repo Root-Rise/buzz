@@ -145,10 +145,9 @@ async fn autonomous_threads_follow_server_inventory_with_exact_profile_and_bindi
         .bind_if_absent(&second, "replacement-stored-b")
         .unwrap();
     until(|| monitor.working_scopes().is_empty()).await;
-    assert!(observer
-        .snapshot()
-        .iter()
-        .any(|e| e.kind == "turn_error" && e.session_id.as_deref() == Some("stored-b")));
+    assert!(observer.snapshot().iter().any(|e| e.kind == "acp_read"
+        && e.payload["status"] == "observation_unavailable"
+        && e.session_id.as_deref() == Some("stored-b")));
     assert!(!monitor.working_scopes().contains(&first));
 }
 
@@ -183,11 +182,11 @@ async fn disconnect_expires_activity_and_reconnect_recovers_without_replaying_re
     assert!(observer
         .snapshot()
         .iter()
-        .any(|e| e.kind == "turn_error" && e.payload["status"] == "unknown"));
+        .any(|e| e.kind == "acp_read" && e.payload["status"] == "observation_unavailable"));
     assert!(!observer
         .snapshot()
         .iter()
-        .any(|e| e.kind == "turn_completed"));
+        .any(|e| e.kind == "turn_completed" && e.payload["outcome"] != "unknown"));
     until(|| {
         fixture.connections.load(Ordering::SeqCst) >= 2
             && monitor.working_scopes() == vec![scope.clone()]

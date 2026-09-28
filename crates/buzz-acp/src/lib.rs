@@ -5,6 +5,7 @@ mod hermes_serve;
 mod serve_activity;
 mod serve_auth;
 mod serve_controls;
+mod serve_observer;
 mod serve_recovery;
 
 mod acp;
@@ -5715,7 +5716,12 @@ async fn initialize_agent_pool(
             state.clone(),
             startup.observer.clone(),
         );
-        pool.recovery_task = Some(serve_recovery::start(config, state, activity.handle()));
+        pool.recovery_task = Some(serve_recovery::start(
+            config,
+            state,
+            activity.handle(),
+            startup.observer.clone(),
+        ));
         pool.activity = Some(activity);
     }
     Ok(pool)

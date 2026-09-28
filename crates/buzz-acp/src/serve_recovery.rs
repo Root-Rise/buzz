@@ -4,7 +4,11 @@ use crate::{
     hermes_serve::{ServeClient, ServeConfig},
     scope::SessionScope,
 };
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 /// Cancels only the bridge's observation task when the pool is retired.
 pub(crate) struct RecoveryTask(tokio::task::JoinHandle<()>);
@@ -19,12 +23,19 @@ pub(crate) fn start(
     config: ServeConfig,
     state: BridgeState,
     activity: crate::serve_activity::ActivityHandle,
+    observer: Option<crate::observer::ObserverHandle>,
 ) -> RecoveryTask {
+    let details = observer.map(|observer| {
+        Arc::new(Mutex::new(crate::serve_observer::ServeObserver::new(
+            observer,
+        )))
+    });
     RecoveryTask(tokio::spawn(async move {
         loop {
             activity.replace_attachments(HashMap::new());
             match ServeClient::connect(config.clone()).await {
                 Ok(mut client) => {
+                    client.set_activity_observer(details.clone());
                     // Reattach all conversations even if no Buzz message arrives after
                     // a Serve restart: reattachment starts the session completion pump.
                     loop {
@@ -60,6 +71,9 @@ async fn reconcile_with_activity(
     for (scope, binding) in state.all_bindings()? {
         let result = async {
             client.ensure_attached(&binding.session_id).await?;
+            if let Err(error) = client.observe_session(&binding.session_id, &scope).await {
+                tracing::warn!(session=%binding.session_id, %error, "Serve activity replay unavailable; receipt recovery continues");
+            }
             if let Some(activity) = activity {
                 activity.replace_attachments(client.attachment_ids());
             }
@@ -237,6 +251,9 @@ mod tests {
                         json!({"id":call["id"],"error":{"code":404,"message":"session unavailable"}})
                     }
                     "session.resume" => json!({"id":call["id"],"result":{"session_id":"runtime"}}),
+                    "session.events.since" => {
+                        json!({"id":call["id"],"error":{"code":500,"message":"telemetry unavailable"}})
+                    }
                     "prompt.status" => {
                         assert_eq!(call["params"]["client_request_id"], "request-key");
                         json!({"id":call["id"],"result":{"accepted":true,"status":"completed"}})
@@ -259,6 +276,7 @@ mod tests {
         })
         .await
         .unwrap();
+        client.set_activity_observer(Some(Arc::new(Mutex::new(crate::serve_observer::ServeObserver::new(crate::observer::ObserverHandle::in_process())))));
         reconcile(&mut client, &state).await.unwrap();
         assert_eq!(state.inputs(&good, None).unwrap()[0].status, "completed");
         assert!(state.binding(&good).unwrap().unwrap().primed);

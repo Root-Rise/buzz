@@ -50,6 +50,30 @@ impl ActivityHandle {
 
     fn emit(&self, kind: &str, scope: &SessionScope, turn: &ObservedTurn, status: &str) {
         if let Some(observer) = &self.observer {
+            if kind == "turn_error" {
+                // Close only this observation's live marker; no success/failure claim.
+                observer.emit(
+                    "turn_completed",
+                    None,
+                    &turn.context,
+                    json!({"outcome":"unknown"}),
+                );
+                let context = ObserverContext {
+                    turn_id: None,
+                    started_at: None,
+                    ..turn.context.clone()
+                };
+                observer.emit(
+                    "acp_read",
+                    None,
+                    &context,
+                    json!({
+                    "status":"observation_unavailable", "title":"Activity unavailable",
+                        "text":"Activity observation was lost; the agent's outcome is unknown.",
+                        "runtimeSessionId":turn.runtime_id,"threadRoot":scope.root_event_id()}),
+                );
+                return;
+            }
             observer.emit(
                 kind,
                 None,
