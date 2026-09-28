@@ -2860,6 +2860,7 @@ async fn tokio_main() -> Result<()> {
         None
     };
     let mut typing_channels: HashMap<scope::SessionScope, ThreadTags> = HashMap::new();
+    let mut last_typing_projection = None;
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
 
     // Independent of pool readiness: a never-mentioned lazy agent must still
@@ -3779,6 +3780,7 @@ async fn tokio_main() -> Result<()> {
                         }).collect()
                     }).unwrap_or_default();
                     let typing = if pool.is_server_owned() { &observed_typing } else { &typing_channels };
+                    let mut published = 0usize;
                     for (scope, thread_tags) in typing {
                         if removed_channels.contains(&scope.channel_id()) { continue; }
                         let ch = scope.channel_id();
@@ -3789,8 +3791,15 @@ async fn tokio_main() -> Result<()> {
                         ) {
                             if let Err(e) = relay.try_publish_event(event) {
                                 tracing::debug!("typing indicator dropped for {ch}: {e}");
+                            } else {
+                                published += 1;
                             }
                         }
+                    }
+                    let projection = (pool.is_server_owned(), typing.len(), published);
+                    if last_typing_projection != Some(projection) {
+                        tracing::info!(server_owned=projection.0, scopes=projection.1, enqueued=projection.2, "Buzz typing projection (relay acceptance not yet proven)");
+                        last_typing_projection = Some(projection);
                     }
                     None
                 }

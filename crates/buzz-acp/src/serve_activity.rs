@@ -25,6 +25,7 @@ struct ActivityState {
     attachments: HashMap<String, String>,
     working: HashMap<SessionScope, ObservedTurn>,
     refreshed: Option<Instant>,
+    diagnostic: Option<([usize; 6], Instant)>,
 }
 struct ObservedTurn {
     last_emitted: Instant,
@@ -87,6 +88,12 @@ impl ActivityHandle {
                     .map(|runtime| (scope.clone(), (binding.session_id.clone(), runtime.clone())))
             })
             .collect();
+        let attachment_count = state.attachments.len();
+        let binding_count = bindings.len();
+        let mapped_live_count = owned
+            .values()
+            .filter(|(_, runtime)| rows.contains_key(runtime.as_str()))
+            .count();
         let mut previous = std::mem::take(&mut state.working);
         for (scope, binding) in bindings {
             let Some(runtime) = state.attachments.get(&binding.session_id) else {
@@ -153,6 +160,28 @@ impl ActivityHandle {
                 &turn,
                 status,
             );
+        }
+        let counts = [
+            attachment_count,
+            binding_count,
+            rows.len(),
+            rows.values().filter(|status| **status == "working").count(),
+            mapped_live_count,
+            state.working.len(),
+        ];
+        if state.diagnostic.is_none_or(|(previous, at)| {
+            previous != counts || now.saturating_duration_since(at) >= Duration::from_secs(60)
+        }) {
+            tracing::info!(
+                attachments = counts[0],
+                bindings = counts[1],
+                inventory = counts[2],
+                inventory_working = counts[3],
+                mapped_live = counts[4],
+                working_scopes = counts[5],
+                "Serve activity projection"
+            );
+            state.diagnostic = Some((counts, now));
         }
         state.refreshed = Some(now);
         Ok(())
