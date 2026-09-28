@@ -133,6 +133,6 @@ async fn gated_events_expect_no_ack_until_actual_drain_and_delayed_sends_expire(
     );
     assert!(delayed.sample());
     delayed.sent(observer.id);
-    delayed.acknowledge(&typing.id.to_hex(), true, "late old ACK");
+    delayed.acknowledge(&typing.id.to_hex(), true);
     assert_eq!(delayed.pending.map(|p| p.0), Some(observer.id));
 }

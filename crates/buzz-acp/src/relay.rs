@@ -2543,12 +2543,8 @@ async fn handle_ws_message(
                     accepted,
                     message,
                 } => {
-                    state
-                        .typing_diagnostics
-                        .acknowledge(&event_id, accepted, &message);
-                    state
-                        .observer_diagnostics
-                        .acknowledge(&event_id, accepted, &message);
+                    state.typing_diagnostics.acknowledge(&event_id, accepted);
+                    state.observer_diagnostics.acknowledge(&event_id, accepted);
                     if !accepted && message.starts_with("auth") {
                         // AUTH OK with accepted=false means auth was rejected.
                         warn!("mid-session AUTH rejected (event {event_id}): {message} — triggering reconnect");

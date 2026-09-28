@@ -47,7 +47,7 @@ impl PublishDiagnostics {
         tracing::warn!(category=self.category, event_id=%id, "Relay publish sample socket write not confirmed; outcome unknown");
     }
 
-    pub(super) fn acknowledge(&mut self, id: &str, accepted: bool, reason: &str) {
+    pub(super) fn acknowledge(&mut self, id: &str, accepted: bool) {
         let Ok(id) = EventId::from_hex(id) else {
             return;
         };
@@ -55,10 +55,8 @@ impl PublishDiagnostics {
             return;
         }
         self.pending = None;
-        // Correlation limits this to a sampled typing/observer EVENT, never
-        // AUTH. Bound even a misbehaving relay's explanation; log no content.
-        let reason: String = reason.chars().take(160).collect();
-        tracing::info!(category=self.category, event_id=%id, accepted, reason, "Relay publish sample relay acknowledgement; recipient delivery not yet proven");
+        // Record only admission metadata, never a relay's free-form explanation.
+        tracing::info!(category=self.category, event_id=%id, accepted, "Relay publish sample relay acknowledgement; recipient delivery not yet proven");
     }
 
     pub(super) fn expire(&mut self) {
