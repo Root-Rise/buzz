@@ -7,34 +7,7 @@ import {
   type ChannelWindowStore,
 } from "./channelWindowStore";
 import { reconcileChannelWindowMessages } from "./channelWindowReconciliation";
-
-export const CHANNEL_WINDOW_FRESH_MS = 5 * 60_000;
-
-/**
- * Subscription setup closes the gap between the initial page and live events,
- * but revisiting a channel with a fresh page has no gap to close. Reconnects
- * still refresh unconditionally at their call site.
- */
-export function shouldRefreshChannelWindowAfterSubscribe(
-  queryClient: QueryClient,
-  channelId: string,
-  now = Date.now(),
-): boolean {
-  const messagesState = queryClient.getQueryState(
-    channelMessagesKey(channelId),
-  );
-  if (!messagesState) return true;
-  if (messagesState.fetchStatus === "fetching") return false;
-  const windowState = queryClient.getQueryState(channelWindowKey(channelId));
-  if (
-    messagesState.status !== "success" ||
-    windowState?.status !== "success" ||
-    windowState.dataUpdatedAt === 0
-  ) {
-    return true;
-  }
-  return now - windowState.dataUpdatedAt >= CHANNEL_WINDOW_FRESH_MS;
-}
+import { channelHeadHydration } from "./channelHeadCache";
 
 /** Keep the rendered timeline cache aligned with its authoritative window. */
 export function projectChannelWindowMessages(
@@ -54,10 +27,27 @@ export async function refreshChannelWindowMessages(
   queryClient: QueryClient,
   channelId: string,
 ) {
-  await queryClient.invalidateQueries({
-    queryKey: channelMessagesKey(channelId),
-    exact: true,
-    refetchType: "active",
-  });
+  const queryKey = channelMessagesKey(channelId);
+  // Sequence behind persisted-head hydration. While the channel query is parked
+  // on that gate it has no data, so TanStack would dedupe this invalidation
+  // onto it — and that fetch returns the seeded snapshot, never asking the
+  // relay. A seeded query is recognisable by data at `dataUpdatedAt` 0; let its
+  // snapshot fetch settle (consuming the mount gate) before invalidating, so
+  // the refetch is a distinct authoritative window fetch. Concurrent callers
+  // (subscribe settlement + reconnect) wake on the same promise, so the seeded
+  // branch must join an authoritative fetch already in flight rather than
+  // cancel and replace it. Cold and warm channels carry no such marker and
+  // dedupe/cancel exactly as before.
+  await channelHeadHydration(queryClient);
+  const query = queryClient.getQueryCache().find({ queryKey, exact: true });
+  const seeded =
+    query?.state.data !== undefined && query.state.dataUpdatedAt === 0;
+  if (seeded) {
+    await query.promise?.catch(() => {});
+  }
+  await queryClient.invalidateQueries(
+    { queryKey, exact: true, refetchType: "active" },
+    { cancelRefetch: !seeded, throwOnError: true },
+  );
   projectChannelWindowMessages(queryClient, channelId);
 }
