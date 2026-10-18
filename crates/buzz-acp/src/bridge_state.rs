@@ -292,6 +292,76 @@ impl BridgeState {
         .collect()
     }
 
+    /// All bindings in reattach order: conversations with unfinished inputs, then the most
+    /// recently addressed, then those never addressed. A restart reattaches every binding
+    /// serially, so scope order left live threads waiting behind long-finished ones.
+    pub fn bindings_by_priority(&self) -> Result<Vec<(SessionScope, Binding)>> {
+        let conn = self.connection()?;
+        let mut query = conn.prepare(
+            "SELECT b.scope,b.session_id,b.primed,b.generation FROM bindings b
+            LEFT JOIN inputs i ON i.namespace=b.namespace AND i.scope=b.scope
+            WHERE b.namespace=? AND b.session_id IS NOT NULL
+            GROUP BY b.scope
+            ORDER BY MAX(i.status IN ('queued','submitting','accepted','uncertain')) DESC,
+                     MAX(i.sequence) IS NULL, MAX(i.sequence) DESC, b.scope",
+        )?;
+        let rows = query.query_map([&self.namespace], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Binding {
+                    session_id: row.get(1)?,
+                    primed: row.get(2)?,
+                    generation: row.get(3)?,
+                },
+            ))
+        })?;
+        rows.map(|row| {
+            let (key, binding) = row?;
+            Ok((parse_scope(&key)?, binding))
+        })
+        .collect()
+    }
+
+    /// Bindings whose conversation accepted an input after `sequence`, newest first, with the
+    /// newest such sequence. Reading both in one query leaves no gap for a later watermark.
+    pub fn bindings_with_input_after(
+        &self,
+        sequence: i64,
+    ) -> Result<Vec<(SessionScope, Binding, i64)>> {
+        let conn = self.connection()?;
+        let mut query = conn.prepare(
+            "SELECT b.scope,b.session_id,b.primed,b.generation,MAX(i.sequence) FROM bindings b
+            JOIN inputs i ON i.namespace=b.namespace AND i.scope=b.scope
+            WHERE b.namespace=? AND b.session_id IS NOT NULL AND i.sequence>?
+            GROUP BY b.scope ORDER BY MAX(i.sequence) DESC",
+        )?;
+        let rows = query.query_map(params![&self.namespace, sequence], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Binding {
+                    session_id: row.get(1)?,
+                    primed: row.get(2)?,
+                    generation: row.get(3)?,
+                },
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (key, binding, latest) = row?;
+            Ok((parse_scope(&key)?, binding, latest))
+        })
+        .collect()
+    }
+
+    /// The newest input sequence in this namespace, or 0 when there is none.
+    pub fn latest_input_sequence(&self) -> Result<i64> {
+        Ok(self.connection()?.query_row(
+            "SELECT COALESCE(MAX(sequence),0) FROM inputs WHERE namespace=?",
+            [&self.namespace],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Freeze the exact prompt and claim its complete event batch before sending it.
     pub fn prepare_submission(
         &self,

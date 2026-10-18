@@ -26,7 +26,9 @@ use std::time::Duration;
 
 /// Default capacity of the event channel from background task to harness.
 /// Override with `BUZZ_ACP_EVENT_BUFFER` env var at startup.
-const EVENT_CHANNEL_CAPACITY_DEFAULT: usize = 256;
+/// A restart replays a busy channel's backlog (about 1,500 events) at once; 256 dropped most
+/// of it into targeted recovery on every start.
+const EVENT_CHANNEL_CAPACITY_DEFAULT: usize = 4096;
 /// Capacity of the command channel from harness to background task.
 const CMD_CHANNEL_CAPACITY: usize = 64;
 

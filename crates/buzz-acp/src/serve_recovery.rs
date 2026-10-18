@@ -5,7 +5,7 @@ use crate::{
     scope::SessionScope,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -68,7 +68,27 @@ async fn reconcile_with_activity(
     activity: Option<&crate::serve_activity::ActivityHandle>,
 ) -> anyhow::Result<()> {
     reconcile_controls(client, state).await?;
-    for (scope, binding) in state.all_bindings()? {
+    // A cold pass attaches every binding serially, which takes minutes. Live work goes first,
+    // and a conversation that receives a message mid-pass is taken next: only this client's
+    // attachments feed activity, so the pool attaching it to run the turn is not enough.
+    let mut pending: VecDeque<(SessionScope, crate::bridge_state::Binding)> =
+        state.bindings_by_priority()?.into();
+    let mut watermark = state.latest_input_sequence()?;
+    let mut visited: HashSet<SessionScope> = HashSet::new();
+    loop {
+        let addressed = state.bindings_with_input_after(watermark)?;
+        for (scope, binding, latest) in addressed.into_iter().rev() {
+            watermark = watermark.max(latest);
+            if !visited.contains(&scope) {
+                pending.push_front((scope, binding));
+            }
+        }
+        let Some((scope, binding)) = pending.pop_front() else {
+            break;
+        };
+        if !visited.insert(scope.clone()) {
+            continue;
+        }
         let result = async {
             client.ensure_attached(&binding.session_id).await?;
             if let Err(error) = client.observe_session(&binding.session_id, &scope).await {

@@ -194,3 +194,87 @@ async fn recovery_retries_only_proven_absent_frozen_request_without_waiting_for_
     assert_eq!(state.pending_controls().unwrap().len(), 1);
     server.abort();
 }
+
+#[tokio::test]
+async fn cold_pass_attaches_live_and_newly_addressed_conversations_first() {
+    let dir = std::env::temp_dir().join(format!("buzz-recovery-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = crate::bridge_state::BridgeState::open(
+        &dir.join("state.db"),
+        "ws://isolated.invalid",
+        &"1".repeat(64),
+    )
+    .unwrap();
+    let channel_id = uuid::Uuid::new_v4();
+    let thread = |c: char| crate::scope::SessionScope::Thread {
+        channel_id,
+        root_event_id: c.to_string().repeat(64),
+    };
+    // Scope order alone would attach finished, idle, live, recent.
+    let (finished, idle, live, recent) = (thread('a'), thread('b'), thread('c'), thread('d'));
+    for (scope, session) in [
+        (&finished, "finished"),
+        (&idle, "idle"),
+        (&live, "live"),
+        (&recent, "recent"),
+    ] {
+        state.bind_if_absent(scope, session).unwrap();
+    }
+    state.accept_event(&finished, "old", &json!({})).unwrap();
+    state.accept_event(&live, "waiting", &json!({})).unwrap();
+    state.accept_event(&recent, "new", &json!({})).unwrap();
+    rusqlite::Connection::open(dir.join("state.db"))
+        .unwrap()
+        .execute(
+            "UPDATE inputs SET status='completed' WHERE event_id IN ('old','new')",
+            [],
+        )
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let order = Arc::new(Mutex::new(Vec::<String>::new()));
+    let observed = order.clone();
+    let (server_state, server_idle) = (state.clone(), idle.clone());
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(Ok(Message::Text(text))) = socket.next().await {
+            let call: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(call["method"], "session.resume");
+            let stored = call["params"]["session_id"].as_str().unwrap().to_owned();
+            let first = {
+                let mut order = observed.lock().unwrap();
+                order.push(stored.clone());
+                order.len() == 1
+            };
+            if first {
+                // A message reaches the idle conversation while the pass is under way.
+                server_state
+                    .accept_event(&server_idle, "arrived", &json!({}))
+                    .unwrap();
+            }
+            socket
+                .send(Message::Text(
+                    json!({"id":call["id"],"result":{"session_id":format!("{stored}-runtime")}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        }
+    });
+    let mut client = ServeClient::connect(config(address)).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::serve_recovery::reconcile(&mut client, &state),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        *order.lock().unwrap(),
+        ["live", "idle", "recent", "finished"],
+        "unfinished work first, then the conversation addressed mid-pass, then by recency"
+    );
+    server.abort();
+}
