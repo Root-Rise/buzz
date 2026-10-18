@@ -323,17 +323,18 @@ impl BridgeState {
     }
 
     /// Bindings whose conversation accepted an input after `sequence`, newest first, with the
-    /// newest such sequence. Reading both in one query leaves no gap for a later watermark.
+    /// newest such sequence. `sequence` is the rowid, so only inputs since then are read.
     pub fn bindings_with_input_after(
         &self,
         sequence: i64,
     ) -> Result<Vec<(SessionScope, Binding, i64)>> {
         let conn = self.connection()?;
         let mut query = conn.prepare(
-            "SELECT b.scope,b.session_id,b.primed,b.generation,MAX(i.sequence) FROM bindings b
-            JOIN inputs i ON i.namespace=b.namespace AND i.scope=b.scope
-            WHERE b.namespace=? AND b.session_id IS NOT NULL AND i.sequence>?
-            GROUP BY b.scope ORDER BY MAX(i.sequence) DESC",
+            "SELECT b.scope,b.session_id,b.primed,b.generation,r.latest
+            FROM (SELECT scope,MAX(sequence) latest FROM inputs
+                  WHERE sequence>?2 AND +namespace=?1 GROUP BY scope) r
+            JOIN bindings b ON b.namespace=?1 AND b.scope=r.scope
+            WHERE b.session_id IS NOT NULL ORDER BY r.latest DESC",
         )?;
         let rows = query.query_map(params![&self.namespace, sequence], |row| {
             Ok((
@@ -353,11 +354,12 @@ impl BridgeState {
         .collect()
     }
 
-    /// The newest input sequence in this namespace, or 0 when there is none.
+    /// The newest input sequence in any namespace, or 0. Sequences are one AUTOINCREMENT
+    /// counter, so this is a valid watermark for every namespace and costs one rowid lookup.
     pub fn latest_input_sequence(&self) -> Result<i64> {
         Ok(self.connection()?.query_row(
-            "SELECT COALESCE(MAX(sequence),0) FROM inputs WHERE namespace=?",
-            [&self.namespace],
+            "SELECT COALESCE(MAX(sequence),0) FROM inputs",
+            [],
             |row| row.get(0),
         )?)
     }

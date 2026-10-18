@@ -278,3 +278,79 @@ async fn cold_pass_attaches_live_and_newly_addressed_conversations_first() {
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn thread_bound_after_its_first_input_is_attached_in_the_same_pass() {
+    let dir = std::env::temp_dir().join(format!("buzz-recovery-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = crate::bridge_state::BridgeState::open(
+        &dir.join("state.db"),
+        "ws://isolated.invalid",
+        &"1".repeat(64),
+    )
+    .unwrap();
+    let channel_id = uuid::Uuid::new_v4();
+    let thread = |c: char| crate::scope::SessionScope::Thread {
+        channel_id,
+        root_event_id: c.to_string().repeat(64),
+    };
+    let (older, old, live, new_thread) = (thread('a'), thread('b'), thread('c'), thread('e'));
+    state.bind_if_absent(&older, "older").unwrap();
+    state.bind_if_absent(&old, "old").unwrap();
+    state.bind_if_absent(&live, "live").unwrap();
+    state
+        .accept_event(&older, "older-input", &json!({}))
+        .unwrap();
+    state.accept_event(&old, "old-input", &json!({})).unwrap();
+    state.accept_event(&live, "waiting", &json!({})).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let order = Arc::new(Mutex::new(Vec::<String>::new()));
+    let observed = order.clone();
+    let (server_state, server_live, server_new) = (state.clone(), live.clone(), new_thread.clone());
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(Ok(Message::Text(text))) = socket.next().await {
+            let call: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(call["method"], "session.resume");
+            let stored = call["params"]["session_id"].as_str().unwrap().to_owned();
+            let attached = {
+                let mut order = observed.lock().unwrap();
+                order.push(stored.clone());
+                order.len()
+            };
+            // The pool journals a new thread's first message and a later message reaches a
+            // conversation already attached this pass; the recovery loop looks for addressed
+            // conversations once more before the pool's session.create returns and binds it.
+            if attached == 1 {
+                server_state
+                    .accept_event(&server_new, "first", &json!({}))
+                    .unwrap();
+                server_state
+                    .accept_event(&server_live, "follow-up", &json!({}))
+                    .unwrap();
+            } else if attached == 2 {
+                server_state.bind_if_absent(&server_new, "new").unwrap();
+            }
+            socket
+                .send(Message::Text(
+                    json!({"id":call["id"],"result":{"session_id":format!("{stored}-runtime")}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        }
+    });
+    let mut client = ServeClient::connect(config(address)).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::serve_recovery::reconcile(&mut client, &state),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(*order.lock().unwrap(), ["live", "old", "new", "older"]);
+    server.abort();
+}

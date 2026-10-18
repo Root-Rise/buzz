@@ -71,16 +71,23 @@ async fn reconcile_with_activity(
     // A cold pass attaches every binding serially, which takes minutes. Live work goes first,
     // and a conversation that receives a message mid-pass is taken next: only this client's
     // attachments feed activity, so the pool attaching it to run the turn is not enough.
+    // The watermark stays at the pass start: a new thread's input is journaled before its
+    // binding exists, so a watermark that advanced could pass it while it was still unbound.
+    let pass_start = state.latest_input_sequence()?;
     let mut pending: VecDeque<(SessionScope, crate::bridge_state::Binding)> =
         state.bindings_by_priority()?.into();
-    let mut watermark = state.latest_input_sequence()?;
     let mut visited: HashSet<SessionScope> = HashSet::new();
     loop {
-        let addressed = state.bindings_with_input_after(watermark)?;
-        for (scope, binding, latest) in addressed.into_iter().rev() {
-            watermark = watermark.max(latest);
-            if !visited.contains(&scope) {
-                pending.push_front((scope, binding));
+        match state.bindings_with_input_after(pass_start) {
+            Ok(addressed) => {
+                for (scope, binding, _) in addressed.into_iter().rev() {
+                    if !visited.contains(&scope) {
+                        pending.push_front((scope, binding));
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Addressed-conversation lookup failed; continuing in priority order")
             }
         }
         let Some((scope, binding)) = pending.pop_front() else {
