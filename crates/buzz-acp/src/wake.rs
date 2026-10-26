@@ -321,11 +321,24 @@ const PRINCIPAL_TTL: Duration = Duration::from_secs(15 * 60);
 const UNRESOLVED_TTL: Duration = Duration::from_secs(60);
 /// How long a channel member list is trusted.
 const MEMBERS_TTL: Duration = Duration::from_secs(60);
-/// Thread roots are immutable; the cache is cleared when it reaches this size.
-const ROOT_CACHE_MAX: usize = 4096;
-/// Bound on each relay query, retries included. A decision makes at most four
-/// queries (bot roles, profiles, thread root, member list), so this keeps one
-/// failing lookup from eating the whole [`DECISION_DEADLINE`].
+/// Size bound for each cache. Thread roots are immutable and simply cleared at
+/// the bound; the failure maps first drop entries older than their TTL.
+const CACHE_MAX: usize = 4096;
+
+/// Keep a failure map bounded: past [`CACHE_MAX`] drop expired entries, and
+/// clear it if that is not enough. Losing a failure mark only costs a retry.
+fn bound_failures<K: std::hash::Hash + Eq>(map: &mut HashMap<K, Instant>) {
+    if map.len() >= CACHE_MAX {
+        map.retain(|_, at| at.elapsed() < UNRESOLVED_TTL);
+    }
+    if map.len() >= CACHE_MAX {
+        map.clear();
+    }
+}
+/// Bound on each relay query, retries included. A cold decision makes up to six
+/// queries (bot roles and profiles for the author, the thread root, the member
+/// list, then bot roles and profiles for the members). Lookups are marked as
+/// failed before they are sent, so one the deadline cuts off still counts.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// [`WakeLookup`] backed by the relay REST API, with caches.
@@ -381,18 +394,19 @@ impl RelayWakeLookup {
         let unresolved = self.unresolved.lock().unwrap();
         for pk in pubkeys {
             let pk = pk.to_ascii_lowercase();
+            let fresh = principals
+                .get(&pk)
+                .filter(|(_, at)| at.elapsed() < PRINCIPAL_TTL);
+            let recently_failed = unresolved
+                .get(&pk)
+                .is_some_and(|at| at.elapsed() < UNRESOLVED_TTL);
             if pk == self.self_pubkey {
                 known.insert(pk, Principal::Agent);
-            } else if let Some((principal, at)) = principals.get(&pk) {
-                if at.elapsed() < PRINCIPAL_TTL {
-                    known.insert(pk, *principal);
-                } else {
-                    pending.push(pk);
-                }
-            } else if unresolved
-                .get(&pk)
-                .is_none_or(|at| at.elapsed() >= UNRESOLVED_TTL)
-            {
+            } else if let Some((principal, _)) = fresh {
+                known.insert(pk, *principal);
+            } else if !recently_failed {
+                // Unknown, or a classification that expired: look it up. A
+                // recent failure is not retried, whatever was known before.
                 pending.push(pk);
             }
         }
@@ -405,6 +419,7 @@ impl RelayWakeLookup {
     fn mark_unresolved(&self, pending: &[String]) {
         let now = Instant::now();
         let mut unresolved = self.unresolved.lock().unwrap();
+        bound_failures(&mut unresolved);
         for pk in pending {
             unresolved.insert(pk.clone(), now);
         }
@@ -420,6 +435,7 @@ impl RelayWakeLookup {
         {
             return false;
         }
+        bound_failures(&mut failed);
         failed.insert(key.to_string(), Instant::now());
         true
     }
@@ -432,6 +448,10 @@ impl RelayWakeLookup {
         let now = Instant::now();
         let mut principals = self.principals.lock().unwrap();
         let mut unresolved = self.unresolved.lock().unwrap();
+        if principals.len() >= CACHE_MAX {
+            principals.retain(|_, (_, at)| at.elapsed() < PRINCIPAL_TTL);
+        }
+        bound_failures(&mut unresolved);
         for pk in looked_up {
             match found.get(pk) {
                 Some(principal) => {
@@ -625,7 +645,7 @@ impl WakeLookup for RelayWakeLookup {
         let root = root_from_event(events.first()?)?;
         self.lookup_succeeded(&key);
         let mut roots = self.roots.lock().unwrap();
-        if roots.len() >= ROOT_CACHE_MAX {
+        if roots.len() >= CACHE_MAX {
             roots.clear();
         }
         roots.insert(root_event_id.to_string(), root.clone());
@@ -662,6 +682,8 @@ impl WakeLookup for RelayWakeLookup {
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Tag};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[derive(Default)]
     struct FakeLookup {
@@ -1089,10 +1111,32 @@ mod tests {
         );
     }
 
+    /// A relay that accepts each connection and drops it at once, counting the
+    /// connections: a request that reaches the relay moves the count.
+    async fn counting_dead_relay(me: &Keys) -> (RelayWakeLookup, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(socket);
+            }
+        });
+        let rest = RestClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{addr}"),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        (RelayWakeLookup::new(rest, &me.public_key().to_hex()), hits)
+    }
+
     #[tokio::test]
     async fn a_dead_relay_is_remembered_under_the_decision_deadline() {
         let me = Keys::generate();
-        let lookup = dead_relay_lookup(&me);
+        let (lookup, hits) = counting_dead_relay(&me).await;
         let human = Keys::generate();
         let event = message(&human, &[], None);
         let me_hex = me.public_key().to_hex();
@@ -1107,13 +1151,45 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key(&human.public_key().to_hex()));
+        assert!(
+            hits.load(Ordering::SeqCst) > 0,
+            "the first decision asked the relay"
+        );
         // The second message from the same author costs no relay round trip.
-        let started = Instant::now();
+        let before = hits.load(Ordering::SeqCst);
         assert_eq!(
             decide_now().await,
             WakeDecision::Skip(SkipReason::Unresolved("author_unclassified"))
         );
-        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(hits.load(Ordering::SeqCst), before);
+    }
+
+    #[tokio::test]
+    async fn an_expired_classification_still_honours_a_recent_failure() {
+        let me = Keys::generate();
+        let (lookup, hits) = counting_dead_relay(&me).await;
+        let pk = Keys::generate().public_key().to_hex();
+        let long_ago = Instant::now()
+            .checked_sub(PRINCIPAL_TTL + Duration::from_secs(1))
+            .expect("monotonic clock has run longer than the TTL");
+        lookup
+            .principals
+            .lock()
+            .unwrap()
+            .insert(pk.clone(), (Principal::Human, long_ago));
+        // Expired: the first call looks it up again, and the relay is down.
+        assert_eq!(
+            lookup.classify(std::slice::from_ref(&pk)).await.get(&pk),
+            None
+        );
+        let before = hits.load(Ordering::SeqCst);
+        assert!(before > 0);
+        // The failure is honoured despite the old classification.
+        assert_eq!(
+            lookup.classify(std::slice::from_ref(&pk)).await.get(&pk),
+            None
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), before);
     }
 
     #[tokio::test]
@@ -1148,12 +1224,29 @@ mod tests {
     #[tokio::test]
     async fn a_failed_member_list_is_not_retried_within_the_ttl() {
         let me = Keys::generate();
-        let lookup = dead_relay_lookup(&me);
+        let (lookup, hits) = counting_dead_relay(&me).await;
         let channel = Uuid::new_v4();
         assert_eq!(lookup.channel_members(channel).await, None);
-        let started = Instant::now();
+        let before = hits.load(Ordering::SeqCst);
+        assert!(before > 0);
         assert_eq!(lookup.channel_members(channel).await, None);
-        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(hits.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn failure_maps_stay_bounded() {
+        let mut map: HashMap<usize, Instant> =
+            (0..CACHE_MAX).map(|i| (i, Instant::now())).collect();
+        bound_failures(&mut map);
+        assert!(map.is_empty(), "all fresh at the bound: cleared");
+        let old = Instant::now()
+            .checked_sub(UNRESOLVED_TTL + Duration::from_secs(1))
+            .unwrap();
+        let mut map: HashMap<usize, Instant> = (0..CACHE_MAX)
+            .map(|i| (i, if i == 0 { Instant::now() } else { old }))
+            .collect();
+        bound_failures(&mut map);
+        assert_eq!(map.len(), 1, "expired entries go first, fresh ones stay");
     }
 
     #[test]
