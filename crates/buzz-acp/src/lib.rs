@@ -23,6 +23,7 @@ mod scope;
 mod session_store;
 mod setup_mode;
 mod usage;
+mod wake;
 
 pub use usage::TurnUsage;
 
@@ -372,6 +373,11 @@ mod inbound_author_gate {
     impl AuthorizedListenerEvent {
         pub(crate) fn into_parts(self) -> (relay::BuzzEvent, String) {
             (self.buzz_event, self.effective_author)
+        }
+
+        /// Read-only view of the authorized event, for the wake policy.
+        pub(crate) fn buzz_event(&self) -> &relay::BuzzEvent {
+            &self.buzz_event
         }
     }
 
@@ -2777,6 +2783,10 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
+    // Addressed wakes need relay lookups (profiles, thread roots, members).
+    let wake_lookup = (config.wake_policy == wake::WakePolicy::Addressed)
+        .then(|| wake::RelayWakeLookup::new(relay.rest_client()));
+
     let base_prompt_content = config.base_prompt_content.take();
     let cwd = current_working_directory()?;
     let ctx = Arc::new(PromptContext {
@@ -3580,7 +3590,60 @@ async fn tokio_main() -> Result<()> {
                             else {
                                 continue;
                             };
-                            let Some(ingress) =
+                            // Under the addressed wake policy the relay delivers
+                            // untagged channel messages too; decide here whether
+                            // this one is addressed to us.
+                            let wake_reason = match &wake_lookup {
+                                None => None,
+                                Some(lookup) => {
+                                    let buzz_event = authorized_event.buzz_event();
+                                    let is_dm =
+                                        is_dm_channel(buzz_event.channel_id, &ctx.channel_info)
+                                            .await;
+                                    match wake::decide(
+                                        lookup,
+                                        &buzz_event.event,
+                                        buzz_event.channel_id,
+                                        is_dm,
+                                        &pubkey_hex,
+                                    )
+                                    .await
+                                    {
+                                        wake::WakeDecision::Wake(reason) => {
+                                            if reason != wake::WakeReason::Mentioned {
+                                                tracing::info!(
+                                                    channel_id = %buzz_event.channel_id,
+                                                    event_id = %buzz_event.event.id,
+                                                    author = %buzz_event.event.pubkey,
+                                                    reason = reason.as_str(),
+                                                    "addressed wake — untagged message addressed to this agent"
+                                                );
+                                            }
+                                            Some(reason)
+                                        }
+                                        wake::WakeDecision::Skip(reason) => {
+                                            if matches!(reason, wake::SkipReason::Unresolved(_)) {
+                                                tracing::warn!(
+                                                    channel_id = %buzz_event.channel_id,
+                                                    event_id = %buzz_event.event.id,
+                                                    author = %buzz_event.event.pubkey,
+                                                    reason = reason.as_str(),
+                                                    "addressed wake undecidable — not waking (fail closed)"
+                                                );
+                                            } else {
+                                                tracing::debug!(
+                                                    channel_id = %buzz_event.channel_id,
+                                                    event_id = %buzz_event.event.id,
+                                                    reason = reason.as_str(),
+                                                    "event not addressed to this agent — dropping"
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+                            };
+                            let Some(mut ingress) =
                                 AuthorizedNormalListenerEvent(authorized_event)
                                     .match_subscription(&rules, &pubkey_hex)
                                     .await
@@ -3588,6 +3651,9 @@ async fn tokio_main() -> Result<()> {
                                 tracing::debug!("authorized event matched no rule — dropping");
                                 continue;
                             };
+                            if let Some(reason) = wake_reason {
+                                ingress.prompt_tag = reason.prompt_tag().to_string();
+                            }
                             // Derive the session scope once, at admission, from
                             // the operator policy, DM status, and NIP-10 thread
                             // tags. Under the default `channel` policy this is
@@ -9306,6 +9372,7 @@ mod build_mcp_servers_tests {
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
+            wake_policy: wake::WakePolicy::Mentions,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,
@@ -9534,6 +9601,7 @@ mod error_outcome_emission_tests {
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
+            wake_policy: wake::WakePolicy::Mentions,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,

@@ -379,6 +379,20 @@ pub struct CliArgs {
     )]
     pub session_policy: crate::scope::SessionPolicy,
 
+    /// Which channel messages wake this agent.
+    /// mentions (default): only events that tag this agent; the relay filters on `#p`.
+    /// addressed: also untagged messages addressed to this agent: a human's
+    /// direct message, a human's reply in a thread this agent started or was
+    /// tagged in at its root, and a human's message where this agent is the
+    /// channel's only agent. Requires `--subscribe mentions`.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_WAKE_POLICY",
+        default_value = "mentions",
+        value_enum
+    )]
+    pub wake_policy: crate::wake::WakePolicy,
+
     /// How to handle new @mentions while a turn is already in-flight.
     /// steer (default): cancel+re-prompt, framing the new mention as a message
     /// that arrived mid-task — the agent keeps working and weaves it in.
@@ -578,6 +592,8 @@ pub struct Config {
     pub dedup_mode: DedupMode,
     /// How ACP provider sessions are scoped in channels (channel vs thread).
     pub session_policy: crate::scope::SessionPolicy,
+    /// Which channel messages wake this agent (see [`crate::wake`]).
+    pub wake_policy: crate::wake::WakePolicy,
     pub multiple_event_handling: MultipleEventHandling,
     pub ignore_self: bool,
     pub kinds_override: Option<Vec<u32>>,
@@ -1031,6 +1047,14 @@ impl Config {
             }
         }
 
+        if args.wake_policy == crate::wake::WakePolicy::Addressed
+            && args.subscribe != SubscribeMode::Mentions
+        {
+            return Err(ConfigError::ConfigFile(
+                "--wake-policy addressed requires --subscribe mentions".into(),
+            ));
+        }
+
         let agent_command = args.agent_command;
 
         if agent_command.trim().is_empty() {
@@ -1265,11 +1289,15 @@ impl Config {
             subscribe_mode: args.subscribe,
             dedup_mode: args.dedup,
             session_policy: args.session_policy,
+            wake_policy: args.wake_policy,
             multiple_event_handling: args.multiple_event_handling,
             ignore_self: !args.no_ignore_self,
             kinds_override: args.kinds,
             channels_override: args.channels,
-            no_mention_filter: args.no_mention_filter,
+            // Addressed wakes are decided locally, so the relay must deliver
+            // untagged channel messages too.
+            no_mention_filter: args.no_mention_filter
+                || args.wake_policy == crate::wake::WakePolicy::Addressed,
             config_path: args.config,
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
@@ -1317,7 +1345,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} wake_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             if self.serve.is_some() { "hermes-serve" } else { &self.agent_command },
@@ -1330,6 +1358,7 @@ impl Config {
             self.subscribe_mode,
             self.dedup_mode,
             self.session_policy,
+            self.wake_policy,
             self.multiple_event_handling,
             self.ignore_self,
             self.context_message_limit,
@@ -1646,6 +1675,7 @@ mod tests {
             subscribe_mode: mode,
             dedup_mode: DedupMode::Queue,
             session_policy: crate::scope::SessionPolicy::Channel,
+            wake_policy: crate::wake::WakePolicy::Mentions,
             multiple_event_handling: MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,
@@ -3041,6 +3071,62 @@ channels = "ALL"
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[test]
+    fn wake_policy_defaults_to_mentions_with_relay_mention_filter() {
+        let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", TEST_PRIVATE_KEY])
+            .expect("clap should parse args");
+        let config = Config::from_args(args).expect("valid config");
+        assert_eq!(config.wake_policy, crate::wake::WakePolicy::Mentions);
+        let channel = uuid::Uuid::new_v4();
+        let filters = resolve_channel_filters(&config, &[channel], &[]);
+        assert!(
+            filters[&channel].require_mention,
+            "mentions keeps #p on the relay REQ"
+        );
+    }
+
+    #[test]
+    fn addressed_wake_policy_drops_the_relay_mention_filter() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--wake-policy",
+            "addressed",
+        ])
+        .expect("clap should parse args");
+        let config = Config::from_args(args).expect("valid config");
+        assert_eq!(config.wake_policy, crate::wake::WakePolicy::Addressed);
+        let channel = uuid::Uuid::new_v4();
+        let filters = resolve_channel_filters(&config, &[channel], &[]);
+        assert!(
+            !filters[&channel].require_mention,
+            "addressed must receive untagged messages to decide on them"
+        );
+        let dynamic = resolve_dynamic_channel_filter(&config, channel, &[])
+            .expect("mentions mode subscribes every channel");
+        assert!(
+            !dynamic.require_mention,
+            "channels joined later need the same REQ"
+        );
+    }
+
+    #[test]
+    fn addressed_wake_policy_requires_mentions_subscribe_mode() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--wake-policy",
+            "addressed",
+            "--subscribe",
+            "all",
+        ])
+        .expect("clap should parse args");
+        let err = Config::from_args(args).expect_err("addressed + all is rejected");
+        assert!(err.to_string().contains("--wake-policy addressed"), "{err}");
+    }
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {
