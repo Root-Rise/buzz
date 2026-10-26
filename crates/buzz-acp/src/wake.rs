@@ -20,10 +20,12 @@
 //!    agent → wake.
 //! 6. This agent is the only agent member of the channel → wake.
 //!
-//! An agent is a pubkey whose kind:0 profile carries a valid NIP-OA `auth`
-//! attestation, or that holds the `bot` role in the channel's kind:39002 member
-//! list. A channel role alone is not enough: the agent that created a channel
-//! holds `owner` there, not `bot`.
+//! An agent is a pubkey that holds the `bot` role in any channel's relay-signed
+//! kind:39002 member list, or whose kind:0 profile carries a valid NIP-OA
+//! `auth` attestation. The role is checked across all channels, not just this
+//! one: the agent that created a channel holds `owner` there, not `bot`. A
+//! human is a pubkey with a profile and neither signal; a pubkey that cannot be
+//! looked up is neither.
 //!
 //! Every lookup fails closed: an author, tag, root or member list that cannot be
 //! resolved means no implicit wake, reported as [`SkipReason::Unresolved`] so
@@ -147,7 +149,7 @@ pub(crate) enum WakeDecision {
 pub(crate) trait WakeLookup {
     /// Classify each pubkey. A pubkey absent from the result could not be
     /// classified.
-    async fn classify(&self, channel_id: Uuid, pubkeys: &[String]) -> HashMap<String, Principal>;
+    async fn classify(&self, pubkeys: &[String]) -> HashMap<String, Principal>;
     /// The thread root event, or `None` if it could not be fetched.
     async fn thread_root(&self, root_event_id: &str) -> Option<RootFacts>;
     /// Every member pubkey of the channel, or `None` if unavailable.
@@ -197,7 +199,7 @@ pub(crate) async fn decide(
         .collect();
     let mut to_classify = others.clone();
     to_classify.push(author.clone());
-    let principals = lookup.classify(channel_id, &to_classify).await;
+    let principals = lookup.classify(&to_classify).await;
     match principals.get(&author) {
         Some(Principal::Human) => {}
         Some(Principal::Agent) => return WakeDecision::Skip(SkipReason::AgentAuthor),
@@ -240,7 +242,7 @@ pub(crate) async fn decide(
     let Some(members) = lookup.channel_members(channel_id).await else {
         return WakeDecision::Skip(SkipReason::Unresolved("channel_members_unavailable"));
     };
-    let member_principals = lookup.classify(channel_id, &members).await;
+    let member_principals = lookup.classify(&members).await;
     let mut agents = Vec::new();
     for member in &members {
         match member_principals.get(member) {
@@ -266,12 +268,7 @@ const ROOT_CACHE_MAX: usize = 4096;
 /// Bound on each relay query so a slow relay cannot stall the listener.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
-struct Member {
-    pubkey: String,
-    role: Option<String>,
-}
-
-type MemberList = std::sync::Arc<Vec<Member>>;
+type MemberList = std::sync::Arc<Vec<String>>;
 
 /// [`WakeLookup`] backed by the relay REST API, with caches.
 pub(crate) struct RelayWakeLookup {
@@ -327,15 +324,9 @@ impl RelayWakeLookup {
         let latest = events
             .iter()
             .max_by_key(|e| e.get("created_at").and_then(Value::as_u64).unwrap_or(0))?;
-        let members: Vec<Member> = tag_rows(latest)
+        let members: Vec<String> = tag_rows(latest)
             .filter(|row| row.first().map(String::as_str) == Some("p"))
-            .filter_map(|row| {
-                let pubkey = PublicKey::from_hex(row.get(1)?).ok()?.to_hex();
-                Some(Member {
-                    pubkey,
-                    role: row.get(3).cloned(),
-                })
-            })
+            .filter_map(|row| Some(PublicKey::from_hex(row.get(1)?).ok()?.to_hex()))
             .collect();
         let members = std::sync::Arc::new(members);
         self.members
@@ -362,6 +353,20 @@ fn tag_rows(event: &Value) -> impl Iterator<Item = Vec<String>> + '_ {
         })
 }
 
+/// Pubkeys holding the `bot` role in any of these kind:39002 member lists
+/// (`["p", <pubkey>, <relay>, <role>]`).
+fn bot_pubkeys(member_lists: &[Value]) -> HashSet<String> {
+    member_lists
+        .iter()
+        .flat_map(tag_rows)
+        .filter(|row| {
+            row.first().map(String::as_str) == Some("p")
+                && row.get(3).map(String::as_str) == Some("bot")
+        })
+        .filter_map(|row| row.get(1).map(|pk| pk.to_ascii_lowercase()))
+        .collect()
+}
+
 /// True if a kind:0 profile carries a NIP-OA attestation that verifies for
 /// `pubkey`, whatever the owner.
 fn profile_has_valid_attestation(profile: &Value, pubkey: &PublicKey) -> bool {
@@ -381,7 +386,7 @@ fn profile_has_valid_attestation(profile: &Value, pubkey: &PublicKey) -> bool {
 }
 
 impl WakeLookup for RelayWakeLookup {
-    async fn classify(&self, channel_id: Uuid, pubkeys: &[String]) -> HashMap<String, Principal> {
+    async fn classify(&self, pubkeys: &[String]) -> HashMap<String, Principal> {
         let mut out = HashMap::new();
         let mut pending = Vec::new();
         {
@@ -399,18 +404,24 @@ impl WakeLookup for RelayWakeLookup {
             return out;
         }
 
-        // A `bot` role in this channel is enough to call a pubkey an agent.
-        if let Some(members) = self.member_list(channel_id).await {
-            pending.retain(|pk| {
-                let is_bot = members
-                    .iter()
-                    .any(|m| m.pubkey == *pk && m.role.as_deref() == Some("bot"));
-                if is_bot {
-                    out.insert(pk.clone(), Principal::Agent);
-                }
-                !is_bot
-            });
-        }
+        // A `bot` role in any channel makes a pubkey an agent. Without this
+        // answer a profile alone cannot prove a pubkey human, so stop here.
+        let bot_filter = nostr::Filter::new()
+            .kind(Kind::Custom(
+                buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16,
+            ))
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::P), pending.clone());
+        let Some(member_lists) = self.query(bot_filter).await else {
+            return out;
+        };
+        let bots = bot_pubkeys(&member_lists);
+        pending.retain(|pk| {
+            let is_bot = bots.contains(pk);
+            if is_bot {
+                out.insert(pk.clone(), Principal::Agent);
+            }
+            !is_bot
+        });
 
         let keys: Vec<PublicKey> = pending
             .iter()
@@ -487,7 +498,7 @@ impl WakeLookup for RelayWakeLookup {
 
     async fn channel_members(&self, channel_id: Uuid) -> Option<Vec<String>> {
         let members = self.member_list(channel_id).await?;
-        Some(members.iter().map(|m| m.pubkey.clone()).collect())
+        Some(members.as_ref().clone())
     }
 }
 
@@ -534,7 +545,7 @@ mod tests {
     }
 
     impl WakeLookup for FakeLookup {
-        async fn classify(&self, _: Uuid, pubkeys: &[String]) -> HashMap<String, Principal> {
+        async fn classify(&self, pubkeys: &[String]) -> HashMap<String, Principal> {
             pubkeys
                 .iter()
                 .filter_map(|pk| self.principals.get(pk).map(|p| (pk.clone(), *p)))
@@ -773,6 +784,26 @@ mod tests {
             run(&base(&w), &w, &event, true).await,
             WakeDecision::Skip(SkipReason::NotMessage)
         );
+    }
+
+    #[test]
+    fn bot_role_in_any_member_list_marks_an_agent() {
+        let lists = vec![
+            serde_json::json!({ "tags": [
+                ["d", "room-a"],
+                ["p", "AA", "", "owner"],
+                ["p", "bb", "", "admin"],
+            ]}),
+            serde_json::json!({ "tags": [
+                ["d", "room-b"],
+                ["p", "aa", "", "bot"],
+                ["p", "cc", "", "member"],
+                ["p", "dd"],
+            ]}),
+        ];
+        let bots = bot_pubkeys(&lists);
+        // `aa` owns room-a but is a bot in room-b: an agent everywhere.
+        assert_eq!(bots, HashSet::from(["aa".to_string()]));
     }
 
     #[test]
