@@ -289,10 +289,14 @@ pub(crate) async fn decide(
         }
     }
 
-    // 5. Sole agent in the channel or DM. This agent never needs a lookup.
+    // 5. Sole agent in the channel or DM. This agent never needs a lookup, but
+    //    it must be on the roster: an empty or stale roster proves nothing.
     let Some(members) = lookup.channel_members(channel_id).await else {
         return WakeDecision::Skip(SkipReason::Unresolved("channel_members_unavailable"));
     };
+    if !members.iter().any(|m| m.eq_ignore_ascii_case(&agent)) {
+        return WakeDecision::Skip(SkipReason::Unresolved("self_not_in_roster"));
+    }
     let others: Vec<String> = members.into_iter().filter(|m| *m != agent).collect();
     let other_principals = lookup.classify(&others).await;
     for member in &others {
@@ -319,11 +323,10 @@ const UNRESOLVED_TTL: Duration = Duration::from_secs(60);
 const MEMBERS_TTL: Duration = Duration::from_secs(60);
 /// Thread roots are immutable; the cache is cleared when it reaches this size.
 const ROOT_CACHE_MAX: usize = 4096;
-/// Bound on each relay query.
-const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
-/// The relay answers a multi-value `#p` query from its newest events up to this
-/// cap and filters afterwards, so a full page may have dropped matches.
-const RELAY_QUERY_CAP: usize = 1000;
+/// Bound on each relay query, retries included. A decision makes at most four
+/// queries (bot roles, profiles, thread root, member list), so this keeps one
+/// failing lookup from eating the whole [`DECISION_DEADLINE`].
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// [`WakeLookup`] backed by the relay REST API, with caches.
 pub(crate) struct RelayWakeLookup {
@@ -333,6 +336,10 @@ pub(crate) struct RelayWakeLookup {
     unresolved: Mutex<HashMap<String, Instant>>,
     members: Mutex<HashMap<Uuid, (Vec<String>, Instant)>>,
     roots: Mutex<HashMap<String, RootFacts>>,
+    /// Root and member-list lookups that failed recently, keyed `root:<id>` or
+    /// `members:<channel>`. Marked before the query is sent, so a lookup cut
+    /// off by the decision deadline still counts as failed.
+    failed: Mutex<HashMap<String, Instant>>,
 }
 
 impl RelayWakeLookup {
@@ -344,11 +351,12 @@ impl RelayWakeLookup {
             unresolved: Mutex::new(HashMap::new()),
             members: Mutex::new(HashMap::new()),
             roots: Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashMap::new()),
         }
     }
 
-    async fn query(&self, filter: nostr::Filter) -> Option<Vec<Value>> {
-        match tokio::time::timeout(LOOKUP_TIMEOUT, self.rest.query(&[filter])).await {
+    async fn query(&self, filters: &[nostr::Filter]) -> Option<Vec<Value>> {
+        match tokio::time::timeout(LOOKUP_TIMEOUT, self.rest.query(filters)).await {
             Ok(Ok(Value::Array(events))) => Some(events),
             Ok(Ok(_)) => {
                 tracing::warn!("wake lookup: relay query returned a non-array");
@@ -391,6 +399,35 @@ impl RelayWakeLookup {
         (known, pending)
     }
 
+    /// Record `pending` as unresolved before querying, so a lookup cut off by
+    /// the decision deadline is still remembered as failed. [`Self::remember`]
+    /// replaces the mark with any answer that arrives.
+    fn mark_unresolved(&self, pending: &[String]) {
+        let now = Instant::now();
+        let mut unresolved = self.unresolved.lock().unwrap();
+        for pk in pending {
+            unresolved.insert(pk.clone(), now);
+        }
+    }
+
+    /// Start a root or member-list lookup: `false` if the same lookup failed
+    /// within [`UNRESOLVED_TTL`]; otherwise mark it failed until it succeeds.
+    fn begin_lookup(&self, key: &str) -> bool {
+        let mut failed = self.failed.lock().unwrap();
+        if failed
+            .get(key)
+            .is_some_and(|at| at.elapsed() < UNRESOLVED_TTL)
+        {
+            return false;
+        }
+        failed.insert(key.to_string(), Instant::now());
+        true
+    }
+
+    fn lookup_succeeded(&self, key: &str) {
+        self.failed.lock().unwrap().remove(key);
+    }
+
     fn remember(&self, looked_up: &[String], found: &HashMap<String, Principal>) {
         let now = Instant::now();
         let mut principals = self.principals.lock().unwrap();
@@ -430,23 +467,31 @@ fn created_at(event: &Value) -> u64 {
 }
 
 /// Pubkeys holding the `bot` role in any of these kind:39002 member lists
-/// (`["p", <pubkey>, <relay>, <role>]`). `None` when the answer may be
-/// incomplete because the relay returned a full page.
-fn bot_pubkeys(member_lists: &[Value]) -> Option<HashSet<String>> {
-    if member_lists.len() >= RELAY_QUERY_CAP {
-        return None;
-    }
-    Some(
-        member_lists
-            .iter()
-            .flat_map(tag_rows)
-            .filter(|row| {
-                row.first().map(String::as_str) == Some("p")
-                    && row.get(3).map(String::as_str) == Some("bot")
-            })
-            .filter_map(|row| row.get(1).map(|pk| pk.to_ascii_lowercase()))
-            .collect(),
-    )
+/// (`["p", <pubkey>, <relay>, <role>]`).
+fn bot_pubkeys(member_lists: &[Value]) -> HashSet<String> {
+    member_lists
+        .iter()
+        .flat_map(tag_rows)
+        .filter(|row| {
+            row.first().map(String::as_str) == Some("p")
+                && row.get(3).map(String::as_str) == Some("bot")
+        })
+        .filter_map(|row| row.get(1).map(|pk| pk.to_ascii_lowercase()))
+        .collect()
+}
+
+/// One kind:39002 filter per pubkey. The relay pushes a single-value `#p` into
+/// its database query; a multi-value `#p` is applied after a capped scan of the
+/// newest rows and can silently miss older rosters.
+fn bot_role_filters(pending: &[String]) -> Vec<nostr::Filter> {
+    pending
+        .iter()
+        .map(|pk| {
+            nostr::Filter::new()
+                .kind(Kind::Custom(KIND_NIP29_GROUP_MEMBERS as u16))
+                .custom_tags(SingleLetterTag::lowercase(Alphabet::P), [pk.as_str()])
+        })
+        .collect()
 }
 
 /// True if a kind:0 profile carries a NIP-OA attestation that verifies for
@@ -538,13 +583,11 @@ impl WakeLookup for RelayWakeLookup {
             return out;
         }
 
-        let bot_filter = nostr::Filter::new()
-            .kind(Kind::Custom(KIND_NIP29_GROUP_MEMBERS as u16))
-            .custom_tags(SingleLetterTag::lowercase(Alphabet::P), pending.clone());
+        self.mark_unresolved(&pending);
         let bots = self
-            .query(bot_filter)
+            .query(&bot_role_filters(&pending))
             .await
-            .and_then(|lists| bot_pubkeys(&lists));
+            .map(|lists| bot_pubkeys(&lists));
         if bots.is_none() {
             tracing::warn!("wake lookup: bot roles unavailable; no pubkey can be shown human");
         }
@@ -560,7 +603,7 @@ impl WakeLookup for RelayWakeLookup {
             let filter = nostr::Filter::new()
                 .kind(Kind::Metadata)
                 .authors(profile_keys);
-            self.query(filter).await.unwrap_or_default()
+            self.query(&[filter]).await.unwrap_or_default()
         };
 
         let found = classify_from(&pending, bots.as_ref(), &profiles);
@@ -574,8 +617,13 @@ impl WakeLookup for RelayWakeLookup {
             return Some(root.clone());
         }
         let id = nostr::EventId::from_hex(root_event_id).ok()?;
-        let events = self.query(nostr::Filter::new().id(id)).await?;
+        let key = format!("root:{root_event_id}");
+        if !self.begin_lookup(&key) {
+            return None;
+        }
+        let events = self.query(&[nostr::Filter::new().id(id)]).await?;
         let root = root_from_event(events.first()?)?;
+        self.lookup_succeeded(&key);
         let mut roots = self.roots.lock().unwrap();
         if roots.len() >= ROOT_CACHE_MAX {
             roots.clear();
@@ -590,13 +638,18 @@ impl WakeLookup for RelayWakeLookup {
                 return Some(members.clone());
             }
         }
+        let key = format!("members:{channel_id}");
+        if !self.begin_lookup(&key) {
+            return None;
+        }
         let filter = nostr::Filter::new()
             .kind(Kind::Custom(KIND_NIP29_GROUP_MEMBERS as u16))
             .custom_tags(
                 SingleLetterTag::lowercase(Alphabet::D),
                 [channel_id.to_string()],
             );
-        let members = members_from_lists(&self.query(filter).await?)?;
+        let members = members_from_lists(&self.query(&[filter]).await?)?;
+        self.lookup_succeeded(&key);
         self.members
             .lock()
             .unwrap()
@@ -938,6 +991,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sole_agent_requires_this_agent_on_the_roster() {
+        let w = world();
+        let lookup = base(&w).members(w.channel, &[&w.human]);
+        let event = message(&w.human, &[], None);
+        assert_eq!(
+            run(&lookup, &w, &event, false).await,
+            WakeDecision::Skip(SkipReason::Unresolved("self_not_in_roster"))
+        );
+        let empty = base(&w).members(w.channel, &[]);
+        assert_eq!(
+            run(&empty, &w, &event, true).await,
+            WakeDecision::Skip(SkipReason::Unresolved("self_not_in_roster"))
+        );
+    }
+
+    #[tokio::test]
     async fn missing_member_list_fails_closed() {
         let w = world();
         let lookup = FakeLookup::default().human(&w.human);
@@ -1020,6 +1089,73 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_dead_relay_is_remembered_under_the_decision_deadline() {
+        let me = Keys::generate();
+        let lookup = dead_relay_lookup(&me);
+        let human = Keys::generate();
+        let event = message(&human, &[], None);
+        let me_hex = me.public_key().to_hex();
+        let channel = Uuid::new_v4();
+        let decide_now = || decide_within_deadline(&lookup, &event, channel, Some(false), &me_hex);
+        assert_eq!(
+            decide_now().await,
+            WakeDecision::Skip(SkipReason::Unresolved("author_unclassified"))
+        );
+        assert!(lookup
+            .unresolved
+            .lock()
+            .unwrap()
+            .contains_key(&human.public_key().to_hex()));
+        // The second message from the same author costs no relay round trip.
+        let started = Instant::now();
+        assert_eq!(
+            decide_now().await,
+            WakeDecision::Skip(SkipReason::Unresolved("author_unclassified"))
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_cut_off_mid_query_is_still_remembered_as_unresolved() {
+        // A relay that accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let me = Keys::generate();
+        let rest = RestClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{addr}"),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        let lookup = RelayWakeLookup::new(rest, &me.public_key().to_hex());
+        let pk = Keys::generate().public_key().to_hex();
+        let cut = tokio::time::timeout(
+            Duration::from_millis(50),
+            lookup.classify(std::slice::from_ref(&pk)),
+        )
+        .await;
+        assert!(cut.is_err(), "the lookup must still be in flight");
+        assert!(lookup.unresolved.lock().unwrap().contains_key(&pk));
+    }
+
+    #[tokio::test]
+    async fn a_failed_member_list_is_not_retried_within_the_ttl() {
+        let me = Keys::generate();
+        let lookup = dead_relay_lookup(&me);
+        let channel = Uuid::new_v4();
+        assert_eq!(lookup.channel_members(channel).await, None);
+        let started = Instant::now();
+        assert_eq!(lookup.channel_members(channel).await, None);
+        assert!(started.elapsed() < Duration::from_millis(200));
+    }
+
     #[test]
     fn failures_are_remembered_as_unresolved_never_as_a_classification() {
         let me = Keys::generate();
@@ -1069,13 +1205,18 @@ mod tests {
             ]}),
         ];
         // `aa` owns room-a but is a bot in room-b: an agent everywhere.
-        assert_eq!(bot_pubkeys(&lists), Some(HashSet::from(["aa".to_string()])));
+        assert_eq!(bot_pubkeys(&lists), HashSet::from(["aa".to_string()]));
     }
 
     #[test]
-    fn a_full_page_of_member_lists_is_not_trusted() {
-        let lists = vec![serde_json::json!({ "tags": [] }); RELAY_QUERY_CAP];
-        assert_eq!(bot_pubkeys(&lists), None);
+    fn bot_roles_are_queried_one_pubkey_per_filter() {
+        let filters = bot_role_filters(&["aa".to_string(), "bb".to_string()]);
+        assert_eq!(filters.len(), 2);
+        for (filter, pk) in filters.iter().zip(["aa", "bb"]) {
+            let json = serde_json::to_value(filter).unwrap();
+            assert_eq!(json["#p"], serde_json::json!([pk]));
+            assert_eq!(json["kinds"], serde_json::json!([KIND_NIP29_GROUP_MEMBERS]));
+        }
     }
 
     #[test]
