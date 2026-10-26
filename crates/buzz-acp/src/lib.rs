@@ -2785,7 +2785,7 @@ async fn tokio_main() -> Result<()> {
 
     // Addressed wakes need relay lookups (profiles, thread roots, members).
     let wake_lookup = (config.wake_policy == wake::WakePolicy::Addressed)
-        .then(|| wake::RelayWakeLookup::new(relay.rest_client()));
+        .then(|| wake::RelayWakeLookup::new(relay.rest_client(), &pubkey_hex));
 
     let base_prompt_content = config.base_prompt_content.take();
     let cwd = current_working_directory()?;
@@ -3597,10 +3597,15 @@ async fn tokio_main() -> Result<()> {
                                 None => None,
                                 Some(lookup) => {
                                     let buzz_event = authorized_event.buzz_event();
-                                    let is_dm =
-                                        is_dm_channel(buzz_event.channel_id, &ctx.channel_info)
-                                            .await;
-                                    match wake::decide(
+                                    // Unlike the author gate, an unresolved
+                                    // channel type must not count as a DM here:
+                                    // that would turn a lookup failure into a wake.
+                                    let is_dm = ctx
+                                        .channel_info
+                                        .resolve_channel_metadata(buzz_event.channel_id)
+                                        .await
+                                        .map(|info| info.channel_type == "dm");
+                                    match wake::decide_within_deadline(
                                         lookup,
                                         &buzz_event.event,
                                         buzz_event.channel_id,

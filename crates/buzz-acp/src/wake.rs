@@ -13,23 +13,30 @@
 //! 1. The event tags this agent → wake. Same as `Mentions`.
 //! 2. Otherwise only a human-authored kind:9 can wake an agent. An
 //!    agent-authored message needs an explicit tag, so agents cannot wake each
-//!    other in a loop.
+//!    other in a loop. Relay-signed workflow messages and owner control
+//!    commands (`!stop`, `!cancel`, …) also need an explicit tag: a control
+//!    command must never reach the model as an ordinary prompt.
 //! 3. If the event tags any other agent, it is addressed to that agent.
-//! 4. A direct message → wake.
-//! 5. A reply in a thread whose root this agent wrote, or whose root tags this
-//!    agent → wake.
-//! 6. This agent is the only agent member of the channel → wake.
+//! 4. A reply in a thread whose root this agent wrote, or whose root tags this
+//!    agent → wake. Every agent the root names wakes, and the root decides for
+//!    the whole thread: tag an agent to pull it into someone else's thread.
+//! 5. This agent is the only agent member of the channel or DM → wake. A group
+//!    DM with several agents wakes none of them implicitly.
 //!
-//! An agent is a pubkey that holds the `bot` role in any channel's relay-signed
-//! kind:39002 member list, or whose kind:0 profile carries a valid NIP-OA
-//! `auth` attestation. The role is checked across all channels, not just this
-//! one: the agent that created a channel holds `owner` there, not `bot`. A
-//! human is a pubkey with a profile and neither signal; a pubkey that cannot be
-//! looked up is neither.
+//! An agent is a pubkey that holds the `bot` role in a relay-signed kind:39002
+//! member list this bridge can read, or whose kind:0 profile carries a valid
+//! NIP-OA `auth` attestation. The role is checked across all readable channels,
+//! not just this one: the agent that created a channel holds `owner` there, not
+//! `bot`. Deployments must therefore keep every agent `bot` in a channel all
+//! bridges share. A human is a pubkey with a profile and neither signal; a
+//! pubkey that cannot be looked up is neither. This bridge's own pubkey is
+//! always an agent.
 //!
-//! Every lookup fails closed: an author, tag, root or member list that cannot be
-//! resolved means no implicit wake, reported as [`SkipReason::Unresolved`] so
-//! the caller logs it at WARN instead of dropping the message silently.
+//! Every lookup fails closed: a channel type, author, tag, root or member list
+//! that cannot be resolved means no implicit wake, reported as
+//! [`SkipReason::Unresolved`] so the caller logs it at WARN instead of dropping
+//! the message silently. The whole decision is bounded by
+//! [`DECISION_DEADLINE`] because it runs on the listener loop.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -39,10 +46,17 @@ use nostr::{Alphabet, Event, Kind, PublicKey, SingleLetterTag};
 use serde_json::Value;
 use uuid::Uuid;
 
-use buzz_core::kind::KIND_STREAM_MESSAGE;
+use buzz_core::kind::{KIND_NIP29_GROUP_MEMBERS, KIND_STREAM_MESSAGE};
 
 use crate::queue::parse_thread_tags;
 use crate::relay::RestClient;
+
+/// Owner control commands; untagged, they are never delivered implicitly.
+const CONTROL_COMMANDS: [&str; 4] = ["!stop", "!cancel", "!rotate", "!shutdown"];
+
+/// Upper bound on one wake decision, all relay lookups included. The decision
+/// runs on the listener loop, so a degraded relay must not stall it longer.
+pub(crate) const DECISION_DEADLINE: Duration = Duration::from_secs(4);
 
 /// Which channel messages wake this agent.
 ///
@@ -85,8 +99,8 @@ pub(crate) struct RootFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WakeReason {
     Mentioned,
-    DirectMessage,
     ThreadParty,
+    DirectMessage,
     SoleAgent,
 }
 
@@ -95,8 +109,8 @@ impl WakeReason {
     pub(crate) fn prompt_tag(self) -> &'static str {
         match self {
             Self::Mentioned => "@mention",
-            Self::DirectMessage => "addressed:dm",
             Self::ThreadParty => "addressed:thread",
+            Self::DirectMessage => "addressed:dm",
             Self::SoleAgent => "addressed:sole-agent",
         }
     }
@@ -104,8 +118,8 @@ impl WakeReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Mentioned => "mentioned",
-            Self::DirectMessage => "direct_message",
             Self::ThreadParty => "thread_party",
+            Self::DirectMessage => "direct_message",
             Self::SoleAgent => "sole_agent",
         }
     }
@@ -116,6 +130,10 @@ impl WakeReason {
 pub(crate) enum SkipReason {
     /// Not a stream message and not tagged.
     NotMessage,
+    /// A relay-signed workflow message that does not tag this agent.
+    Workflow,
+    /// An owner control command that does not tag this agent.
+    UntaggedControl,
     /// Written by an agent and not tagged.
     AgentAuthor,
     /// Tags another agent and not this one.
@@ -130,6 +148,8 @@ impl SkipReason {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::NotMessage => "not_message",
+            Self::Workflow => "workflow",
+            Self::UntaggedControl => "untagged_control",
             Self::AgentAuthor => "agent_author",
             Self::AddressedToOtherAgent => "addressed_to_other_agent",
             Self::NotAddressed => "not_addressed",
@@ -169,12 +189,39 @@ fn p_tags(event: &Event) -> Vec<String> {
         .collect()
 }
 
+fn has_tag(event: &Event, name: &str) -> bool {
+    event
+        .tags
+        .iter()
+        .any(|tag| tag.as_slice().first().map(String::as_str) == Some(name))
+}
+
+/// [`decide`] bounded by [`DECISION_DEADLINE`]; a timeout fails closed.
+pub(crate) async fn decide_within_deadline(
+    lookup: &impl WakeLookup,
+    event: &Event,
+    channel_id: Uuid,
+    is_dm: Option<bool>,
+    agent_pubkey_hex: &str,
+) -> WakeDecision {
+    tokio::time::timeout(
+        DECISION_DEADLINE,
+        decide(lookup, event, channel_id, is_dm, agent_pubkey_hex),
+    )
+    .await
+    .unwrap_or(WakeDecision::Skip(SkipReason::Unresolved(
+        "decision_timeout",
+    )))
+}
+
 /// Decide whether `event` in `channel_id` wakes the agent `agent_pubkey_hex`.
+///
+/// `is_dm` is `None` when the channel type could not be resolved.
 pub(crate) async fn decide(
     lookup: &impl WakeLookup,
     event: &Event,
     channel_id: Uuid,
-    is_dm: bool,
+    is_dm: Option<bool>,
     agent_pubkey_hex: &str,
 ) -> WakeDecision {
     let agent = agent_pubkey_hex.to_ascii_lowercase();
@@ -186,10 +233,15 @@ pub(crate) async fn decide(
         return WakeDecision::Wake(WakeReason::Mentioned);
     }
 
-    // 2. Implicit wakes: human-authored stream messages only.
-    // Only a stream message can be addressed implicitly.
+    // 2. Implicit wakes: human-authored, ordinary stream messages only.
     if event.kind != Kind::Custom(KIND_STREAM_MESSAGE as u16) {
         return WakeDecision::Skip(SkipReason::NotMessage);
+    }
+    if has_tag(event, "buzz:workflow") {
+        return WakeDecision::Skip(SkipReason::Workflow);
+    }
+    if CONTROL_COMMANDS.contains(&event.content.trim()) {
+        return WakeDecision::Skip(SkipReason::UntaggedControl);
     }
     let others: Vec<String> = tagged
         .into_iter()
@@ -221,12 +273,11 @@ pub(crate) async fn decide(
         return WakeDecision::Skip(SkipReason::Unresolved("tag_unclassified"));
     }
 
-    // 4. Direct message.
-    if is_dm {
-        return WakeDecision::Wake(WakeReason::DirectMessage);
-    }
+    let Some(is_dm) = is_dm else {
+        return WakeDecision::Skip(SkipReason::Unresolved("channel_type_unresolved"));
+    };
 
-    // 5. Reply in a thread this agent is party to.
+    // 4. Reply in a thread this agent is party to.
     if let Some(root_id) = parse_thread_tags(event).root_event_id {
         let Some(root) = lookup.thread_root(&root_id.to_ascii_lowercase()).await else {
             return WakeDecision::Skip(SkipReason::Unresolved("thread_root_unavailable"));
@@ -238,51 +289,59 @@ pub(crate) async fn decide(
         }
     }
 
-    // 6. Sole agent in the channel.
+    // 5. Sole agent in the channel or DM. This agent never needs a lookup.
     let Some(members) = lookup.channel_members(channel_id).await else {
         return WakeDecision::Skip(SkipReason::Unresolved("channel_members_unavailable"));
     };
-    let member_principals = lookup.classify(&members).await;
-    let mut agents = Vec::new();
-    for member in &members {
-        match member_principals.get(member) {
-            Some(Principal::Agent) => agents.push(member.as_str()),
+    let others: Vec<String> = members.into_iter().filter(|m| *m != agent).collect();
+    let other_principals = lookup.classify(&others).await;
+    for member in &others {
+        match other_principals.get(member) {
+            Some(Principal::Agent) => return WakeDecision::Skip(SkipReason::NotAddressed),
             Some(Principal::Human) => {}
             None => return WakeDecision::Skip(SkipReason::Unresolved("member_unclassified")),
         }
     }
-    if agents == [agent.as_str()] {
-        return WakeDecision::Wake(WakeReason::SoleAgent);
-    }
-
-    WakeDecision::Skip(SkipReason::NotAddressed)
+    WakeDecision::Wake(if is_dm {
+        WakeReason::DirectMessage
+    } else {
+        WakeReason::SoleAgent
+    })
 }
 
 /// How long a pubkey classification is trusted. Profiles and roles change
 /// rarely; a newly registered agent is picked up within this window.
 const PRINCIPAL_TTL: Duration = Duration::from_secs(15 * 60);
+/// How long a pubkey that could not be classified is left unclassified before
+/// it is looked up again. Bounds relay load from members without a profile.
+const UNRESOLVED_TTL: Duration = Duration::from_secs(60);
 /// How long a channel member list is trusted.
 const MEMBERS_TTL: Duration = Duration::from_secs(60);
 /// Thread roots are immutable; the cache is cleared when it reaches this size.
 const ROOT_CACHE_MAX: usize = 4096;
-/// Bound on each relay query so a slow relay cannot stall the listener.
-const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
-
-type MemberList = std::sync::Arc<Vec<String>>;
+/// Bound on each relay query.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// The relay answers a multi-value `#p` query from its newest events up to this
+/// cap and filters afterwards, so a full page may have dropped matches.
+const RELAY_QUERY_CAP: usize = 1000;
 
 /// [`WakeLookup`] backed by the relay REST API, with caches.
 pub(crate) struct RelayWakeLookup {
     rest: RestClient,
+    self_pubkey: String,
     principals: Mutex<HashMap<String, (Principal, Instant)>>,
-    members: Mutex<HashMap<Uuid, (MemberList, Instant)>>,
+    unresolved: Mutex<HashMap<String, Instant>>,
+    members: Mutex<HashMap<Uuid, (Vec<String>, Instant)>>,
     roots: Mutex<HashMap<String, RootFacts>>,
 }
 
 impl RelayWakeLookup {
-    pub(crate) fn new(rest: RestClient) -> Self {
+    pub(crate) fn new(rest: RestClient, self_pubkey_hex: &str) -> Self {
         Self {
             rest,
+            self_pubkey: self_pubkey_hex.to_ascii_lowercase(),
             principals: Mutex::new(HashMap::new()),
+            unresolved: Mutex::new(HashMap::new()),
             members: Mutex::new(HashMap::new()),
             roots: Mutex::new(HashMap::new()),
         }
@@ -306,34 +365,47 @@ impl RelayWakeLookup {
         }
     }
 
-    async fn member_list(&self, channel_id: Uuid) -> Option<MemberList> {
-        if let Some((members, at)) = self.members.lock().unwrap().get(&channel_id) {
-            if at.elapsed() < MEMBERS_TTL {
-                return Some(members.clone());
+    /// Split `pubkeys` into cached answers and the ones still to look up.
+    fn split_cached(&self, pubkeys: &[String]) -> (HashMap<String, Principal>, Vec<String>) {
+        let mut known = HashMap::new();
+        let mut pending = Vec::new();
+        let principals = self.principals.lock().unwrap();
+        let unresolved = self.unresolved.lock().unwrap();
+        for pk in pubkeys {
+            let pk = pk.to_ascii_lowercase();
+            if pk == self.self_pubkey {
+                known.insert(pk, Principal::Agent);
+            } else if let Some((principal, at)) = principals.get(&pk) {
+                if at.elapsed() < PRINCIPAL_TTL {
+                    known.insert(pk, *principal);
+                } else {
+                    pending.push(pk);
+                }
+            } else if unresolved
+                .get(&pk)
+                .is_none_or(|at| at.elapsed() >= UNRESOLVED_TTL)
+            {
+                pending.push(pk);
             }
         }
-        let filter = nostr::Filter::new()
-            .kind(Kind::Custom(
-                buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16,
-            ))
-            .custom_tags(
-                SingleLetterTag::lowercase(Alphabet::D),
-                [channel_id.to_string()],
-            );
-        let events = self.query(filter).await?;
-        let latest = events
-            .iter()
-            .max_by_key(|e| e.get("created_at").and_then(Value::as_u64).unwrap_or(0))?;
-        let members: Vec<String> = tag_rows(latest)
-            .filter(|row| row.first().map(String::as_str) == Some("p"))
-            .filter_map(|row| Some(PublicKey::from_hex(row.get(1)?).ok()?.to_hex()))
-            .collect();
-        let members = std::sync::Arc::new(members);
-        self.members
-            .lock()
-            .unwrap()
-            .insert(channel_id, (members.clone(), Instant::now()));
-        Some(members)
+        (known, pending)
+    }
+
+    fn remember(&self, looked_up: &[String], found: &HashMap<String, Principal>) {
+        let now = Instant::now();
+        let mut principals = self.principals.lock().unwrap();
+        let mut unresolved = self.unresolved.lock().unwrap();
+        for pk in looked_up {
+            match found.get(pk) {
+                Some(principal) => {
+                    principals.insert(pk.clone(), (*principal, now));
+                    unresolved.remove(pk);
+                }
+                None => {
+                    unresolved.insert(pk.clone(), now);
+                }
+            }
+        }
     }
 }
 
@@ -353,18 +425,28 @@ fn tag_rows(event: &Value) -> impl Iterator<Item = Vec<String>> + '_ {
         })
 }
 
+fn created_at(event: &Value) -> u64 {
+    event.get("created_at").and_then(Value::as_u64).unwrap_or(0)
+}
+
 /// Pubkeys holding the `bot` role in any of these kind:39002 member lists
-/// (`["p", <pubkey>, <relay>, <role>]`).
-fn bot_pubkeys(member_lists: &[Value]) -> HashSet<String> {
-    member_lists
-        .iter()
-        .flat_map(tag_rows)
-        .filter(|row| {
-            row.first().map(String::as_str) == Some("p")
-                && row.get(3).map(String::as_str) == Some("bot")
-        })
-        .filter_map(|row| row.get(1).map(|pk| pk.to_ascii_lowercase()))
-        .collect()
+/// (`["p", <pubkey>, <relay>, <role>]`). `None` when the answer may be
+/// incomplete because the relay returned a full page.
+fn bot_pubkeys(member_lists: &[Value]) -> Option<HashSet<String>> {
+    if member_lists.len() >= RELAY_QUERY_CAP {
+        return None;
+    }
+    Some(
+        member_lists
+            .iter()
+            .flat_map(tag_rows)
+            .filter(|row| {
+                row.first().map(String::as_str) == Some("p")
+                    && row.get(3).map(String::as_str) == Some("bot")
+            })
+            .filter_map(|row| row.get(1).map(|pk| pk.to_ascii_lowercase()))
+            .collect(),
+    )
 }
 
 /// True if a kind:0 profile carries a NIP-OA attestation that verifies for
@@ -385,90 +467,105 @@ fn profile_has_valid_attestation(profile: &Value, pubkey: &PublicKey) -> bool {
         })
 }
 
+/// Classify `pending` from the relay's answers. `bots` is `None` when the
+/// bot-role query failed: then nobody can be shown human, and only a valid
+/// attestation still proves an agent. A pubkey with no profile stays
+/// unclassified.
+fn classify_from(
+    pending: &[String],
+    bots: Option<&HashSet<String>>,
+    profiles: &[Value],
+) -> HashMap<String, Principal> {
+    let mut latest: HashMap<String, &Value> = HashMap::new();
+    for profile in profiles {
+        let Some(author) = profile.get("pubkey").and_then(Value::as_str) else {
+            continue;
+        };
+        let author = author.to_ascii_lowercase();
+        if latest
+            .get(&author)
+            .is_none_or(|prev| created_at(prev) < created_at(profile))
+        {
+            latest.insert(author, profile);
+        }
+    }
+    let mut out = HashMap::new();
+    for pk in pending {
+        if bots.is_some_and(|bots| bots.contains(pk)) {
+            out.insert(pk.clone(), Principal::Agent);
+            continue;
+        }
+        let (Some(profile), Ok(key)) = (latest.get(pk), PublicKey::from_hex(pk)) else {
+            continue;
+        };
+        if profile_has_valid_attestation(profile, &key) {
+            out.insert(pk.clone(), Principal::Agent);
+        } else if bots.is_some() {
+            out.insert(pk.clone(), Principal::Human);
+        }
+    }
+    out
+}
+
+/// Member pubkeys from the newest kind:39002 list for a channel.
+fn members_from_lists(member_lists: &[Value]) -> Option<Vec<String>> {
+    let latest = member_lists.iter().max_by_key(|e| created_at(e))?;
+    Some(
+        tag_rows(latest)
+            .filter(|row| row.first().map(String::as_str) == Some("p"))
+            .filter_map(|row| Some(PublicKey::from_hex(row.get(1)?).ok()?.to_hex()))
+            .collect(),
+    )
+}
+
+/// Author and tagged pubkeys of a fetched thread root.
+fn root_from_event(event: &Value) -> Option<RootFacts> {
+    let author = event
+        .get("pubkey")
+        .and_then(Value::as_str)?
+        .to_ascii_lowercase();
+    let tagged = tag_rows(event)
+        .filter(|row| row.first().map(String::as_str) == Some("p"))
+        .filter_map(|row| row.get(1).map(|v| v.to_ascii_lowercase()))
+        .collect();
+    Some(RootFacts { author, tagged })
+}
+
 impl WakeLookup for RelayWakeLookup {
     async fn classify(&self, pubkeys: &[String]) -> HashMap<String, Principal> {
-        let mut out = HashMap::new();
-        let mut pending = Vec::new();
-        {
-            let cache = self.principals.lock().unwrap();
-            for pk in pubkeys {
-                match cache.get(pk) {
-                    Some((principal, at)) if at.elapsed() < PRINCIPAL_TTL => {
-                        out.insert(pk.clone(), *principal);
-                    }
-                    _ => pending.push(pk.clone()),
-                }
-            }
-        }
+        let (mut out, pending) = self.split_cached(pubkeys);
         if pending.is_empty() {
             return out;
         }
 
-        // A `bot` role in any channel makes a pubkey an agent. Without this
-        // answer a profile alone cannot prove a pubkey human, so stop here.
         let bot_filter = nostr::Filter::new()
-            .kind(Kind::Custom(
-                buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16,
-            ))
+            .kind(Kind::Custom(KIND_NIP29_GROUP_MEMBERS as u16))
             .custom_tags(SingleLetterTag::lowercase(Alphabet::P), pending.clone());
-        let Some(member_lists) = self.query(bot_filter).await else {
-            return out;
-        };
-        let bots = bot_pubkeys(&member_lists);
-        pending.retain(|pk| {
-            let is_bot = bots.contains(pk);
-            if is_bot {
-                out.insert(pk.clone(), Principal::Agent);
-            }
-            !is_bot
-        });
+        let bots = self
+            .query(bot_filter)
+            .await
+            .and_then(|lists| bot_pubkeys(&lists));
+        if bots.is_none() {
+            tracing::warn!("wake lookup: bot roles unavailable; no pubkey can be shown human");
+        }
 
-        let keys: Vec<PublicKey> = pending
+        let profile_keys: Vec<PublicKey> = pending
             .iter()
+            .filter(|pk| bots.as_ref().is_none_or(|bots| !bots.contains(*pk)))
             .filter_map(|pk| PublicKey::from_hex(pk).ok())
             .collect();
-        if !keys.is_empty() {
+        let profiles = if profile_keys.is_empty() {
+            Vec::new()
+        } else {
             let filter = nostr::Filter::new()
                 .kind(Kind::Metadata)
-                .authors(keys.clone());
-            if let Some(profiles) = self.query(filter).await {
-                let mut latest: HashMap<String, &Value> = HashMap::new();
-                for profile in &profiles {
-                    let Some(author) = profile.get("pubkey").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let created = profile
-                        .get("created_at")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    let newer = latest.get(author).is_none_or(|prev| {
-                        prev.get("created_at").and_then(Value::as_u64).unwrap_or(0) < created
-                    });
-                    if newer {
-                        latest.insert(author.to_ascii_lowercase(), profile);
-                    }
-                }
-                for key in &keys {
-                    let hex = key.to_hex();
-                    // No profile at all proves nothing either way: leave it
-                    // unclassified rather than assume human.
-                    if let Some(profile) = latest.get(&hex) {
-                        let principal = if profile_has_valid_attestation(profile, key) {
-                            Principal::Agent
-                        } else {
-                            Principal::Human
-                        };
-                        out.insert(hex, principal);
-                    }
-                }
-            }
-        }
+                .authors(profile_keys);
+            self.query(filter).await.unwrap_or_default()
+        };
 
-        let mut cache = self.principals.lock().unwrap();
-        let now = Instant::now();
-        for (pk, principal) in &out {
-            cache.insert(pk.clone(), (*principal, now));
-        }
+        let found = classify_from(&pending, bots.as_ref(), &profiles);
+        self.remember(&pending, &found);
+        out.extend(found);
         out
     }
 
@@ -478,16 +575,7 @@ impl WakeLookup for RelayWakeLookup {
         }
         let id = nostr::EventId::from_hex(root_event_id).ok()?;
         let events = self.query(nostr::Filter::new().id(id)).await?;
-        let event = events.first()?;
-        let author = event
-            .get("pubkey")
-            .and_then(Value::as_str)?
-            .to_ascii_lowercase();
-        let tagged = tag_rows(event)
-            .filter(|row| row.first().map(String::as_str) == Some("p"))
-            .filter_map(|row| row.get(1).map(|v| v.to_ascii_lowercase()))
-            .collect();
-        let root = RootFacts { author, tagged };
+        let root = root_from_event(events.first()?)?;
         let mut roots = self.roots.lock().unwrap();
         if roots.len() >= ROOT_CACHE_MAX {
             roots.clear();
@@ -497,8 +585,23 @@ impl WakeLookup for RelayWakeLookup {
     }
 
     async fn channel_members(&self, channel_id: Uuid) -> Option<Vec<String>> {
-        let members = self.member_list(channel_id).await?;
-        Some(members.as_ref().clone())
+        if let Some((members, at)) = self.members.lock().unwrap().get(&channel_id) {
+            if at.elapsed() < MEMBERS_TTL {
+                return Some(members.clone());
+            }
+        }
+        let filter = nostr::Filter::new()
+            .kind(Kind::Custom(KIND_NIP29_GROUP_MEMBERS as u16))
+            .custom_tags(
+                SingleLetterTag::lowercase(Alphabet::D),
+                [channel_id.to_string()],
+            );
+        let members = members_from_lists(&self.query(filter).await?)?;
+        self.members
+            .lock()
+            .unwrap()
+            .insert(channel_id, (members.clone(), Instant::now()));
+        Some(members)
     }
 }
 
@@ -559,7 +662,13 @@ mod tests {
         }
     }
 
-    fn message(author: &Keys, tagged: &[&Keys], root: Option<&Event>) -> Event {
+    fn message_with(
+        author: &Keys,
+        tagged: &[&Keys],
+        root: Option<&Event>,
+        content: &str,
+        extra: &[[&str; 2]],
+    ) -> Event {
         let mut tags: Vec<Tag> = tagged
             .iter()
             .map(|k| Tag::parse(["p", &k.public_key().to_hex()]).unwrap())
@@ -567,10 +676,17 @@ mod tests {
         if let Some(root) = root {
             tags.push(Tag::parse(["e", &root.id.to_hex(), "", "reply"]).unwrap());
         }
-        EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "hi")
+        for tag in extra {
+            tags.push(Tag::parse(*tag).unwrap());
+        }
+        EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), content)
             .tags(tags)
             .sign_with_keys(author)
             .unwrap()
+    }
+
+    fn message(author: &Keys, tagged: &[&Keys], root: Option<&Event>) -> Event {
+        message_with(author, tagged, root, "hi", &[])
     }
 
     struct World {
@@ -591,17 +707,27 @@ mod tests {
         }
     }
 
+    /// A channel with this agent, another agent and a human. The fake never
+    /// classifies `me`: `decide` must not need to look itself up.
     fn base(w: &World) -> FakeLookup {
         FakeLookup::default()
-            .agent(&w.me)
             .agent(&w.other)
             .human(&w.human)
             .human(&w.second_human)
             .members(w.channel, &[&w.me, &w.other, &w.human])
     }
 
-    async fn run(lookup: &FakeLookup, w: &World, event: &Event, is_dm: bool) -> WakeDecision {
+    async fn run_as(
+        lookup: &FakeLookup,
+        w: &World,
+        event: &Event,
+        is_dm: Option<bool>,
+    ) -> WakeDecision {
         decide(lookup, event, w.channel, is_dm, &w.me.public_key().to_hex()).await
+    }
+
+    async fn run(lookup: &FakeLookup, w: &World, event: &Event, is_dm: bool) -> WakeDecision {
+        run_as(lookup, w, event, Some(is_dm)).await
     }
 
     #[tokio::test]
@@ -687,12 +813,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn human_direct_message_wakes() {
+    async fn human_direct_message_to_me_alone_wakes() {
         let w = world();
+        let lookup = base(&w).members(w.channel, &[&w.me, &w.human]);
         let event = message(&w.human, &[], None);
         assert_eq!(
-            run(&base(&w), &w, &event, true).await,
+            run(&lookup, &w, &event, true).await,
             WakeDecision::Wake(WakeReason::DirectMessage)
+        );
+    }
+
+    #[tokio::test]
+    async fn group_dm_with_two_agents_wakes_neither_implicitly() {
+        let w = world();
+        let lookup = base(&w); // me, other agent, human
+        let event = message(&w.human, &[], None);
+        assert_eq!(
+            run(&lookup, &w, &event, true).await,
+            WakeDecision::Skip(SkipReason::NotAddressed)
         );
     }
 
@@ -714,6 +852,42 @@ mod tests {
         assert_eq!(
             run(&base(&w), &w, &event, false).await,
             WakeDecision::Skip(SkipReason::NotAddressed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_channel_type_fails_closed() {
+        let w = world();
+        let lookup = base(&w).members(w.channel, &[&w.me, &w.human]);
+        let event = message(&w.human, &[], None);
+        assert_eq!(
+            run_as(&lookup, &w, &event, None).await,
+            WakeDecision::Skip(SkipReason::Unresolved("channel_type_unresolved"))
+        );
+    }
+
+    #[tokio::test]
+    async fn untagged_control_command_is_never_delivered() {
+        let w = world();
+        let lookup = base(&w).members(w.channel, &[&w.me, &w.human]);
+        for command in CONTROL_COMMANDS {
+            let event = message_with(&w.human, &[], None, &format!(" {command}\n"), &[]);
+            assert_eq!(
+                run(&lookup, &w, &event, false).await,
+                WakeDecision::Skip(SkipReason::UntaggedControl),
+                "{command}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn untagged_workflow_message_does_not_wake() {
+        let w = world();
+        let lookup = base(&w).members(w.channel, &[&w.me, &w.human]);
+        let event = message_with(&w.human, &[], None, "run", &[["buzz:workflow", "true"]]);
+        assert_eq!(
+            run(&lookup, &w, &event, false).await,
+            WakeDecision::Skip(SkipReason::Workflow)
         );
     }
 
@@ -766,7 +940,7 @@ mod tests {
     #[tokio::test]
     async fn missing_member_list_fails_closed() {
         let w = world();
-        let lookup = FakeLookup::default().agent(&w.me).human(&w.human);
+        let lookup = FakeLookup::default().human(&w.human);
         let event = message(&w.human, &[], None);
         assert_eq!(
             run(&lookup, &w, &event, false).await,
@@ -786,6 +960,99 @@ mod tests {
         );
     }
 
+    struct SlowLookup;
+
+    impl WakeLookup for SlowLookup {
+        async fn classify(&self, _: &[String]) -> HashMap<String, Principal> {
+            tokio::time::sleep(DECISION_DEADLINE * 2).await;
+            HashMap::new()
+        }
+        async fn thread_root(&self, _: &str) -> Option<RootFacts> {
+            None
+        }
+        async fn channel_members(&self, _: Uuid) -> Option<Vec<String>> {
+            None
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_relay_hits_the_decision_deadline() {
+        let w = world();
+        let event = message(&w.human, &[], None);
+        let decision = decide_within_deadline(
+            &SlowLookup,
+            &event,
+            w.channel,
+            Some(false),
+            &w.me.public_key().to_hex(),
+        )
+        .await;
+        assert_eq!(
+            decision,
+            WakeDecision::Skip(SkipReason::Unresolved("decision_timeout"))
+        );
+    }
+
+    // ── RelayWakeLookup caching, against a relay that refuses connections ──
+
+    fn dead_relay_lookup(me: &Keys) -> RelayWakeLookup {
+        let rest = RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:9".into(),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        RelayWakeLookup::new(rest, &me.public_key().to_hex())
+    }
+
+    #[tokio::test]
+    async fn a_dead_relay_classifies_nobody_except_self() {
+        let me = Keys::generate();
+        let lookup = dead_relay_lookup(&me);
+        let human = Keys::generate().public_key().to_hex();
+        let found = lookup
+            .classify(&[human.clone(), me.public_key().to_hex().to_uppercase()])
+            .await;
+        assert_eq!(found.get(&human), None, "a failed lookup is not human");
+        assert_eq!(
+            found.get(&me.public_key().to_hex()),
+            Some(&Principal::Agent)
+        );
+    }
+
+    #[test]
+    fn failures_are_remembered_as_unresolved_never_as_a_classification() {
+        let me = Keys::generate();
+        let lookup = dead_relay_lookup(&me);
+        let (known, unknown) = ("aa".to_string(), "bb".to_string());
+        lookup.remember(
+            &[known.clone(), unknown.clone()],
+            &HashMap::from([(known.clone(), Principal::Human)]),
+        );
+        let (cached, pending) = lookup.split_cached(&[known.clone(), unknown.clone()]);
+        assert_eq!(cached, HashMap::from([(known, Principal::Human)]));
+        // Within UNRESOLVED_TTL the failure is neither re-queried nor answered.
+        assert!(pending.is_empty());
+        assert!(!cached.contains_key(&unknown));
+    }
+
+    // ── Relay answer parsing ──────────────────────────────────────────────
+
+    fn profile(keys: &Keys, auth: Option<&Keys>, created_at: u64) -> Value {
+        let tags = match auth {
+            Some(owner) => vec![serde_json::from_str::<Value>(
+                &buzz_sdk::nip_oa::compute_auth_tag(owner, &keys.public_key(), "").unwrap(),
+            )
+            .unwrap()],
+            None => vec![],
+        };
+        serde_json::json!({
+            "pubkey": keys.public_key().to_hex(),
+            "created_at": created_at,
+            "tags": tags,
+        })
+    }
+
     #[test]
     fn bot_role_in_any_member_list_marks_an_agent() {
         let lists = vec![
@@ -801,18 +1068,101 @@ mod tests {
                 ["p", "dd"],
             ]}),
         ];
-        let bots = bot_pubkeys(&lists);
         // `aa` owns room-a but is a bot in room-b: an agent everywhere.
-        assert_eq!(bots, HashSet::from(["aa".to_string()]));
+        assert_eq!(bot_pubkeys(&lists), Some(HashSet::from(["aa".to_string()])));
+    }
+
+    #[test]
+    fn a_full_page_of_member_lists_is_not_trusted() {
+        let lists = vec![serde_json::json!({ "tags": [] }); RELAY_QUERY_CAP];
+        assert_eq!(bot_pubkeys(&lists), None);
+    }
+
+    #[test]
+    fn classify_from_uses_bots_profiles_and_never_guesses() {
+        let (bot, attested, plain, absent, owner) = (
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+        );
+        let hex = |k: &Keys| k.public_key().to_hex();
+        let pending = [hex(&bot), hex(&attested), hex(&plain), hex(&absent)];
+        let bots = HashSet::from([hex(&bot)]);
+        let profiles = vec![
+            profile(&attested, Some(&owner), 1),
+            profile(&plain, None, 1),
+        ];
+
+        let found = classify_from(&pending, Some(&bots), &profiles);
+        assert_eq!(found.get(&hex(&bot)), Some(&Principal::Agent));
+        assert_eq!(found.get(&hex(&attested)), Some(&Principal::Agent));
+        assert_eq!(found.get(&hex(&plain)), Some(&Principal::Human));
+        assert_eq!(found.get(&hex(&absent)), None, "no profile is not human");
+
+        // Without the bot-role answer nobody can be shown human.
+        let found = classify_from(&pending, None, &profiles);
+        assert_eq!(found.get(&hex(&attested)), Some(&Principal::Agent));
+        assert_eq!(found.get(&hex(&plain)), None);
+        assert_eq!(found.get(&hex(&bot)), None);
+    }
+
+    #[test]
+    fn classify_from_reads_the_newest_profile() {
+        let (agent, owner) = (Keys::generate(), Keys::generate());
+        let pk = agent.public_key().to_hex();
+        let bots = HashSet::new();
+        let newest_plain = vec![profile(&agent, Some(&owner), 1), profile(&agent, None, 2)];
+        assert_eq!(
+            classify_from(std::slice::from_ref(&pk), Some(&bots), &newest_plain).get(&pk),
+            Some(&Principal::Human)
+        );
+        let newest_attested = vec![profile(&agent, None, 1), profile(&agent, Some(&owner), 2)];
+        assert_eq!(
+            classify_from(std::slice::from_ref(&pk), Some(&bots), &newest_attested).get(&pk),
+            Some(&Principal::Agent)
+        );
+    }
+
+    #[test]
+    fn members_come_from_the_newest_list() {
+        let (a, b) = (Keys::generate(), Keys::generate());
+        let lists = vec![
+            serde_json::json!({ "created_at": 1, "tags": [["p", a.public_key().to_hex(), "", "bot"]] }),
+            serde_json::json!({ "created_at": 2, "tags": [
+                ["d", "room"],
+                ["p", b.public_key().to_hex(), "", "member"],
+                ["p", "not-hex", "", "member"],
+            ]}),
+        ];
+        assert_eq!(
+            members_from_lists(&lists),
+            Some(vec![b.public_key().to_hex()])
+        );
+        assert_eq!(members_from_lists(&[]), None);
+    }
+
+    #[test]
+    fn root_facts_are_lowercased() {
+        let root = serde_json::json!({
+            "pubkey": "ABCD",
+            "tags": [["p", "EF01"], ["e", "1234"]],
+        });
+        assert_eq!(
+            root_from_event(&root),
+            Some(RootFacts {
+                author: "abcd".into(),
+                tagged: vec!["ef01".into()],
+            })
+        );
     }
 
     #[test]
     fn attestation_check_accepts_an_owner_signed_auth_tag() {
         let agent = Keys::generate();
         let owner = Keys::generate();
-        let tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "").unwrap();
-        let tag: Value = serde_json::from_str(&tag).unwrap();
-        let profile = serde_json::json!({ "tags": [tag] });
+        let profile = profile(&agent, Some(&owner), 1);
         assert!(profile_has_valid_attestation(&profile, &agent.public_key()));
         // The same tag does not make a different key an agent.
         assert!(!profile_has_valid_attestation(
