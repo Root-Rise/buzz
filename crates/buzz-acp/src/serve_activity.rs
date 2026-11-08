@@ -1,7 +1,10 @@
 //! Serve-owned activity, independent of Buzz request dispatch and completion.
 //!
-//! Inventory is process-wide. Only runtime IDs learned through this profile's
-//! recovery attachments may light up a durable Buzz conversation.
+//! An old Serve's inventory is process-wide, so only runtime IDs learned through this profile's
+//! recovery attachments may light up a durable Buzz conversation. A Serve that advertises
+//! residency filters the inventory to this profile and names each row's `conversation_root`,
+//! which maps to a durable binding with no attachment at all. `session_key` is never used: it
+//! is the compression tip, not proof of ownership.
 use crate::{
     bridge_state::{Binding, BridgeState},
     hermes_serve::{ServeClient, ServeConfig},
@@ -86,19 +89,56 @@ impl ActivityHandle {
         }
     }
 
+    /// Project a whole-process inventory through this connection's attachments.
     fn refresh(
         &self,
         snapshot: &Value,
         bindings: Vec<(SessionScope, Binding)>,
         now: Instant,
     ) -> anyhow::Result<()> {
-        let rows = snapshot["sessions"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("Serve activity inventory has no sessions array"))?;
-        let rows: HashMap<&str, &str> = rows
-            .iter()
-            .filter_map(|row| Some((row["id"].as_str()?, row["status"].as_str()?)))
-            .collect();
+        let rows = inventory_rows(snapshot)?;
+        let routes = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Serve activity lock poisoned"))?
+            .attachments
+            .clone();
+        self.project(&rows, &routes, bindings, false, now)
+    }
+
+    /// Project this profile's working rows through their conversation roots.
+    fn refresh_working(
+        &self,
+        snapshot: &Value,
+        bindings: Vec<(SessionScope, Binding)>,
+        now: Instant,
+    ) -> anyhow::Result<()> {
+        let rows = inventory_rows(snapshot)?;
+        let mut routes: HashMap<String, String> = HashMap::new();
+        for row in snapshot["sessions"].as_array().into_iter().flatten() {
+            let (Some(root), Some(runtime)) =
+                (row["conversation_root"].as_str(), row["id"].as_str())
+            else {
+                continue;
+            };
+            // One conversation can have several live rows; a working one decides its typing.
+            if row["status"] == "working" || !routes.contains_key(root) {
+                routes.insert(root.to_owned(), runtime.to_owned());
+            }
+        }
+        self.project(&rows, &routes, bindings, true, now)
+    }
+
+    /// `routes` maps stored IDs to runtimes. With `working_only`, a missing row means the
+    /// session stopped working; in a full inventory it means observation was lost.
+    fn project(
+        &self,
+        rows: &HashMap<&str, &str>,
+        routes: &HashMap<String, String>,
+        bindings: Vec<(SessionScope, Binding)>,
+        working_only: bool,
+        now: Instant,
+    ) -> anyhow::Result<()> {
         let mut state = self
             .inner
             .lock()
@@ -106,11 +146,14 @@ impl ActivityHandle {
         let owned: HashMap<_, _> = bindings
             .iter()
             .filter_map(|(scope, binding)| {
-                state
-                    .attachments
+                routes
                     .get(&binding.session_id)
                     .map(|runtime| (scope.clone(), (binding.session_id.clone(), runtime.clone())))
             })
+            .collect();
+        let bound: HashMap<SessionScope, String> = bindings
+            .iter()
+            .map(|(scope, binding)| (scope.clone(), binding.session_id.clone()))
             .collect();
         let attachment_count = state.attachments.len();
         let binding_count = bindings.len();
@@ -120,7 +163,7 @@ impl ActivityHandle {
             .count();
         let mut previous = std::mem::take(&mut state.working);
         for (scope, binding) in bindings {
-            let Some(runtime) = state.attachments.get(&binding.session_id) else {
+            let Some(runtime) = routes.get(&binding.session_id) else {
                 continue;
             };
             if rows.get(runtime.as_str()) != Some(&"working") {
@@ -163,14 +206,18 @@ impl ActivityHandle {
             state.working.insert(scope, turn);
         }
         for (scope, turn) in previous {
-            let still_owned = owned.get(&scope).is_some_and(|(stored, runtime)| {
-                *runtime == turn.runtime_id
-                    && turn.context.session_id.as_deref() == Some(stored.as_str())
-            });
+            let still_owned = if working_only {
+                bound.get(&scope).map(String::as_str) == turn.context.session_id.as_deref()
+            } else {
+                owned.get(&scope).is_some_and(|(stored, runtime)| {
+                    *runtime == turn.runtime_id
+                        && turn.context.session_id.as_deref() == Some(stored.as_str())
+                })
+            };
             let status = if still_owned {
                 rows.get(turn.runtime_id.as_str())
                     .copied()
-                    .unwrap_or("unknown")
+                    .unwrap_or(if working_only { "idle" } else { "unknown" })
             } else {
                 "unknown"
             };
@@ -235,6 +282,16 @@ impl ActivityHandle {
     }
 }
 
+fn inventory_rows(snapshot: &Value) -> anyhow::Result<HashMap<&str, &str>> {
+    let rows = snapshot["sessions"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Serve activity inventory has no sessions array"))?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| Some((row["id"].as_str()?, row["status"].as_str()?)))
+        .collect())
+}
+
 /// A bounded snapshot observer; no resume, prompt, or control RPC is issued here.
 pub(crate) struct ActivityMonitor {
     handle: ActivityHandle,
@@ -258,11 +315,23 @@ impl ActivityMonitor {
                 let connected = ServeClient::connect(config.clone()).await;
                 match connected {
                     Ok(client) => loop {
-                        let result =
-                            tokio::time::timeout(SNAPSHOT_TIMEOUT, client.active_sessions()).await;
+                        // Read once: the request and its projection must agree.
+                        let working_only = client.residency().is_supported();
+                        let result = tokio::time::timeout(SNAPSHOT_TIMEOUT, async {
+                            if working_only {
+                                client.working_sessions().await
+                            } else {
+                                client.active_sessions().await
+                            }
+                        })
+                        .await;
                         let refreshed = match result {
                             Ok(Ok(snapshot)) => state.all_bindings().and_then(|bindings| {
-                                observed.refresh(&snapshot, bindings, Instant::now())
+                                if working_only {
+                                    observed.refresh_working(&snapshot, bindings, Instant::now())
+                                } else {
+                                    observed.refresh(&snapshot, bindings, Instant::now())
+                                }
                             }),
                             Ok(Err(error)) => Err(error.into()),
                             Err(_) => {

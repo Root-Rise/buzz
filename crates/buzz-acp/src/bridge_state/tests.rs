@@ -181,3 +181,55 @@ fn legacy_admission_is_unknown_and_confirmed_admission_survives_uncertain_restar
     assert_eq!(reopened.submission_admission("legacy")?, None);
     Ok(())
 }
+
+#[test]
+fn recovery_queries_find_only_unfinished_work_and_read_no_payloads() -> Result<()> {
+    let (path, key, _) = fixture();
+    let state = BridgeState::open(&path, "wss://test.example", &key)?;
+    let scope = |tag: &str| SessionScope::Thread {
+        channel_id: Uuid::nil(),
+        root_event_id: tag.repeat(64),
+    };
+    let (done, queued, fenced, control, idle) =
+        (scope("a"), scope("b"), scope("c"), scope("d"), scope("e"));
+    for (scope, stored) in [
+        (&done, "done"),
+        (&queued, "queued"),
+        (&fenced, "fenced"),
+        (&control, "control"),
+        (&idle, "idle"),
+    ] {
+        state.bind_if_absent(scope, stored)?;
+    }
+    state.accept_event(&done, "finished", &json!({}))?;
+    state.prepare_submission(&["finished".into()], "done-key", &json!({}))?;
+    state.finish_batch(&["finished".into()], "completed")?;
+    state.accept_event(&fenced, "unsure", &json!({}))?;
+    state.prepare_submission(&["unsure".into()], "unsure-key", &json!({}))?;
+    state.finish_batch(&["unsure".into()], "uncertain")?;
+    state.accept_event(&queued, "waiting", &json!({}))?;
+    state.record_cancel(&control, "stop")?;
+    // Unbound work has nothing to attach to, and open_requests must not parse this.
+    state.accept_event(&scope("f"), "unbound", &json!({}))?;
+    rusqlite::Connection::open(&path)?.execute(
+        "UPDATE inputs SET payload='not json' WHERE event_id='unsure'",
+        [],
+    )?;
+
+    let found: Vec<SessionScope> = state
+        .bindings_needing_recovery()?
+        .into_iter()
+        .map(|(scope, _)| scope)
+        .collect();
+    assert_eq!(found, vec![queued.clone(), fenced.clone(), control.clone()]);
+    assert_eq!(
+        state.open_requests(&fenced)?,
+        vec![("unsure".to_owned(), "unsure-key".to_owned())]
+    );
+    assert!(state.open_requests(&queued)?.is_empty());
+    assert!(state.open_requests(&done)?.is_empty());
+    let matched = state.bindings_for_sessions(&["idle".into(), "nobody".into()])?;
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].0, idle);
+    Ok(())
+}

@@ -204,3 +204,135 @@ async fn disconnect_expires_activity_and_reconnect_recovers_without_replaying_re
     assert!(monitor.working_scopes().is_empty());
     assert_eq!(fixture.state.unfinished_counts().unwrap()["queued"], 1);
 }
+
+/// A Serve advertising residency: answers only `{working_only:true}` inventory for one profile.
+struct ResidencyServe {
+    rows: Arc<Mutex<Value>>,
+    hellos: Arc<AtomicUsize>,
+    server: tokio::task::JoinHandle<()>,
+    address: std::net::SocketAddr,
+}
+impl Drop for ResidencyServe {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+impl ResidencyServe {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let rows = Arc::new(Mutex::new(json!({"sessions":[]})));
+        let hellos = Arc::new(AtomicUsize::new(0));
+        let (inventory, greeted) = (rows.clone(), hellos.clone());
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(socket).await.unwrap();
+                let ready = json!({"jsonrpc":"2.0","method":"event","params":{
+                    "type":"gateway.ready","payload":{"capabilities":{"residency":1}}}});
+                socket
+                    .send(Message::Text(ready.to_string().into()))
+                    .await
+                    .unwrap();
+                while let Some(Ok(Message::Text(raw))) = socket.next().await {
+                    let call: Value = serde_json::from_str(&raw).unwrap();
+                    let result = match call["method"].as_str().unwrap() {
+                        "session.client_hello" => {
+                            greeted.fetch_add(1, Ordering::SeqCst);
+                            json!({"pins_sessions":false})
+                        }
+                        "session.active_list" => {
+                            assert_eq!(call["params"]["profile"], "activity-test");
+                            assert_eq!(call["params"]["working_only"], true);
+                            inventory.lock().unwrap().clone()
+                        }
+                        other => panic!("activity must not call {other}"),
+                    };
+                    socket
+                        .send(Message::Text(
+                            json!({"id":call["id"],"result":result}).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        Self {
+            rows,
+            hellos,
+            server,
+            address,
+        }
+    }
+    fn config(&self) -> ServeConfig {
+        ServeConfig {
+            url: format!("ws://{}", self.address),
+            profile: "activity-test".into(),
+            token: None,
+            credentials: None,
+            model: None,
+            effort: None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn working_rows_map_by_conversation_root_without_any_attachment() {
+    let fixture = Fixture::new().await;
+    let (first, second) = (fixture.bind("5", "root-a"), fixture.bind("6", "root-b"));
+    let idle = fixture.bind("7", "root-idle");
+    let serve = ResidencyServe::start().await;
+    let observer = ObserverHandle::in_process();
+    let monitor = ActivityMonitor::start(
+        serve.config(),
+        fixture.state.clone(),
+        Some(observer.clone()),
+    );
+    *serve.rows.lock().unwrap() = json!({"sessions":[
+        {"id":"runtime-a","status":"working","session_key":"tip-a","conversation_root":"root-a"},
+        {"id":"runtime-b","status":"working","session_key":"tip-b","conversation_root":"root-b"},
+        // A compression tip naming a bound session is not ownership.
+        {"id":"runtime-x","status":"working","session_key":"root-idle","conversation_root":"unbound"},
+        {"id":"runtime-w","status":"waiting","session_key":"tip-w","conversation_root":"root-idle"}
+    ]});
+    until(|| monitor.working_scopes().len() == 2).await;
+    let working = monitor.working_scopes();
+    assert!(working.contains(&first) && working.contains(&second) && !working.contains(&idle));
+    assert!(serve.hellos.load(Ordering::SeqCst) >= 1);
+    // A row dropping out of the working list finished normally; it is not lost observation.
+    serve.rows.lock().unwrap()["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .remove(0);
+    until(|| monitor.working_scopes() == vec![second.clone()]).await;
+    let events = observer.snapshot();
+    assert!(events
+        .iter()
+        .any(|e| e.kind == "turn_completed" && e.session_id.as_deref() == Some("root-a")));
+    assert!(!events
+        .iter()
+        .any(|e| e.kind == "acp_read" && e.payload["status"] == "observation_unavailable"));
+}
+
+#[tokio::test]
+async fn rebinding_a_working_conversation_still_reports_lost_observation() {
+    let fixture = Fixture::new().await;
+    let scope = fixture.bind("8", "root-before");
+    let serve = ResidencyServe::start().await;
+    let observer = ObserverHandle::in_process();
+    let monitor = ActivityMonitor::start(
+        serve.config(),
+        fixture.state.clone(),
+        Some(observer.clone()),
+    );
+    *serve.rows.lock().unwrap() = json!({"sessions":[
+        {"id":"runtime","status":"working","session_key":"k","conversation_root":"root-before"}
+    ]});
+    until(|| monitor.working_scopes() == vec![scope.clone()]).await;
+    assert!(fixture.state.retire(&scope, "root-before").unwrap());
+    fixture.state.bind_if_absent(&scope, "root-after").unwrap();
+    until(|| monitor.working_scopes().is_empty()).await;
+    assert!(observer.snapshot().iter().any(|e| e.kind == "acp_read"
+        && e.payload["status"] == "observation_unavailable"
+        && e.session_id.as_deref() == Some("root-before")));
+}

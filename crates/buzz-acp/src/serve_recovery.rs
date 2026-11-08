@@ -1,7 +1,7 @@
 //! Reattach unattended sessions and reconcile exact durable requests against server receipts.
 use crate::{
     bridge_state::BridgeState,
-    hermes_serve::{ServeClient, ServeConfig},
+    hermes_serve::{stored_row_is_gone, ServeClient, ServeConfig},
     scope::SessionScope,
 };
 use std::{
@@ -36,8 +36,10 @@ pub(crate) fn start(
             match ServeClient::connect(config.clone()).await {
                 Ok(mut client) => {
                     client.set_activity_observer(details.clone());
-                    // Reattach all conversations even if no Buzz message arrives after
-                    // a Serve restart: reattachment starts the session completion pump.
+                    tracing::info!(residency=?client.residency(), "Serve recovery connected");
+                    // Run even if no Buzz message arrives after a Serve restart: reattachment
+                    // starts the session completion pump. A Serve that manages residency is
+                    // asked which conversations need it; any other gets all of them attached.
                     loop {
                         if let Err(error) =
                             reconcile_with_activity(&mut client, &state, Some(&activity)).await
@@ -74,10 +76,20 @@ async fn reconcile_with_activity(
     // The watermark stays at the pass start: a new thread's input is journaled before its
     // binding exists, so a watermark that advanced could pass it while it was still unbound.
     let pass_start = state.latest_input_sequence()?;
-    let mut pending: VecDeque<(SessionScope, crate::bridge_state::Binding)> =
-        state.bindings_by_priority()?.into();
+    let attach_all = !client.residency().is_supported();
+    let mut pending: VecDeque<(SessionScope, crate::bridge_state::Binding)> = if attach_all {
+        state.bindings_by_priority()?.into()
+    } else {
+        narrowed_targets(client, state).await?.into()
+    };
     let mut visited: HashSet<SessionScope> = HashSet::new();
     loop {
+        // A late ready frame or a reconnect can reveal residency support mid-pass. Attaching
+        // the rest would re-hydrate every conversation; the next pass narrows instead.
+        if attach_all && client.residency().is_supported() {
+            tracing::info!("Serve advertised residency; ending attach-all pass");
+            break;
+        }
         match state.bindings_with_input_after(pass_start) {
             Ok(addressed) => {
                 for (scope, binding, _) in addressed.into_iter().rev() {
@@ -108,14 +120,66 @@ async fn reconcile_with_activity(
         }
         .await;
         if let Err(error) = result {
-            if matches!(
-                error.downcast_ref::<crate::acp::AcpError>(),
-                Some(crate::acp::AcpError::ServeUnavailable(_))
-            ) {
+            let cause = error.downcast_ref::<crate::acp::AcpError>();
+            if matches!(cause, Some(crate::acp::AcpError::ServeUnavailable(_))) {
                 return Err(error);
+            }
+            if cause.is_some_and(stored_row_is_gone) {
+                settle_gone_conversation(state, &scope)?;
+                continue;
             }
             tracing::error!(scope=%scope.telemetry_label(),error=%error,"Serve conversation recovery blocked; continuing other conversations");
         }
+    }
+    Ok(())
+}
+
+/// The conversations this pass must visit on a Serve that manages residency: locally unfinished
+/// work first, then what Serve reports. A failed report narrows this pass to the local set and
+/// is asked for again next pass; only a dead connection ends the pass.
+async fn narrowed_targets(
+    client: &ServeClient,
+    state: &BridgeState,
+) -> anyhow::Result<Vec<(SessionScope, crate::bridge_state::Binding)>> {
+    let mut targets = state.bindings_needing_recovery()?;
+    let reports = [
+        ("working sessions", client.working_sessions().await),
+        ("durable work", client.durable_work().await),
+    ];
+    let mut roots = Vec::new();
+    for (name, report) in reports {
+        let report = match report {
+            Ok(report) => report,
+            Err(error @ crate::acp::AcpError::ServeUnavailable(_)) => return Err(error.into()),
+            Err(error) => {
+                tracing::warn!(%error, report = name, "Serve report failed; narrowing to local work this pass");
+                continue;
+            }
+        };
+        let Some(rows) = report["sessions"].as_array() else {
+            tracing::warn!(
+                report = name,
+                "Serve report malformed; narrowing to local work this pass"
+            );
+            continue;
+        };
+        roots.extend(
+            rows.iter()
+                .filter_map(|row| row["conversation_root"].as_str())
+                .map(str::to_owned),
+        );
+    }
+    targets.extend(state.bindings_for_sessions(&roots)?);
+    Ok(targets)
+}
+
+/// A deleted Hermes row can never answer for its requests; unfence rather than retry forever.
+fn settle_gone_conversation(state: &BridgeState, scope: &SessionScope) -> anyhow::Result<()> {
+    let requests = state.open_requests(scope)?;
+    if !requests.is_empty() {
+        let ids: Vec<String> = requests.into_iter().map(|(id, _)| id).collect();
+        tracing::error!(scope=%scope.telemetry_label(),count=ids.len(),"Serve row is gone; failing its unsettled requests");
+        state.finish_batch(&ids, "failed")?;
     }
     Ok(())
 }
@@ -140,6 +204,8 @@ async fn reconcile_controls(client: &mut ServeClient, state: &BridgeState) -> an
                         );
                 }
                 Err(error @ crate::acp::AcpError::ServeUnavailable(_)) => return Err(error.into()),
+                // With the row gone there is no turn left to cancel.
+                Err(error) if stored_row_is_gone(&error) => {}
                 Err(error) => {
                     tracing::error!(event_id=%control.event_id,request_key=%key,error=%error,
                         "Durable cancel pending; continuing other controls");
@@ -161,15 +227,8 @@ async fn reconcile_scope(
     stored: &str,
 ) -> anyhow::Result<()> {
     let mut requests: HashMap<String, Vec<String>> = HashMap::new();
-    for input in state.inputs(scope, None)? {
-        if matches!(
-            input.status.as_str(),
-            "submitting" | "accepted" | "uncertain"
-        ) {
-            if let Some(key) = input.request_key {
-                requests.entry(key).or_default().push(input.event_id);
-            }
-        }
+    for (event_id, key) in state.open_requests(scope)? {
+        requests.entry(key).or_default().push(event_id);
     }
     for (key, ids) in requests {
         let mut receipt = client.request_status(stored, &key).await?;
@@ -236,6 +295,10 @@ async fn reconcile_scope(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "serve_recovery/residency_tests.rs"]
+mod residency_tests;
 
 #[cfg(test)]
 mod tests {

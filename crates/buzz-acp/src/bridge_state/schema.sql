@@ -10,6 +10,9 @@ PRAGMA journal_mode=WAL;
                payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', request_key TEXT,
                UNIQUE(namespace,event_id));
              CREATE INDEX IF NOT EXISTS inputs_pending ON inputs(namespace,scope,status,sequence);
+             CREATE INDEX IF NOT EXISTS inputs_unfinished ON inputs(namespace,scope,sequence)
+               WHERE status IN ('queued','submitting','accepted','uncertain');
+             CREATE INDEX IF NOT EXISTS bindings_session ON bindings(namespace,session_id);
              CREATE TABLE IF NOT EXISTS submissions (
                namespace TEXT NOT NULL, request_key TEXT NOT NULL, payload TEXT NOT NULL, server_accepted INTEGER,
                PRIMARY KEY(namespace,request_key));

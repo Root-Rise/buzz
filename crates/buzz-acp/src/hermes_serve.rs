@@ -11,7 +11,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Configuration for a profile on the existing shared Serve endpoint.
@@ -74,6 +74,64 @@ fn journal_error(error: anyhow::Error) -> AcpError {
     AcpError::SubmissionUncertain(format!("durable bridge receipt failed: {error}"))
 }
 
+/// How long a new connection waits for `gateway.ready` before its first RPC. Serve writes that
+/// frame before it reads any RPC, so an RPC response can never overtake it: a frame still absent
+/// when this expires means a stalled Serve or one that never sends it, not a lost race.
+const READY_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(5)
+};
+
+/// What this connection's `gateway.ready` frame said about memory-residency support.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServeResidency {
+    /// No frame yet. Acted on as `Unsupported`; a later frame still upgrades the connection.
+    Unknown,
+    Unsupported,
+    Supported,
+}
+
+impl ServeResidency {
+    pub(crate) fn is_supported(self) -> bool {
+        self == Self::Supported
+    }
+}
+
+fn ready_residency(frame: &Value) -> Option<ServeResidency> {
+    if frame["method"] != "event" || frame["params"]["type"] != "gateway.ready" {
+        return None;
+    }
+    let advertised = frame["params"]["payload"]["capabilities"]["residency"]
+        .as_u64()
+        .is_some_and(|version| version >= 1);
+    Some(if advertised {
+        ServeResidency::Supported
+    } else {
+        ServeResidency::Unsupported
+    })
+}
+
+/// 4001: this runtime ID is not in Serve's memory, so nothing was admitted on it.
+fn runtime_is_stale(error: &AcpError) -> bool {
+    matches!(error, AcpError::AgentError { code: 4001, .. })
+}
+
+/// 4007 "session not found": the stored row no longer exists. The same code also carries
+/// "session no longer live; retry resume", a transient reattach race that proves nothing.
+pub(crate) fn stored_row_is_gone(error: &AcpError) -> bool {
+    matches!(error, AcpError::AgentError { code: 4007, message } if message.contains("not found"))
+}
+
+/// A request could not be placed on a runtime: failed only if the row is provably gone.
+fn attach_failure(error: AcpError) -> AcpError {
+    if stored_row_is_gone(&error) {
+        AcpError::RemoteTurnFailed(error.to_string())
+    } else {
+        AcpError::SubmissionUncertain(error.to_string())
+    }
+}
+
 type Reply = oneshot::Sender<Result<Value, AcpError>>;
 struct Call {
     method: String,
@@ -94,6 +152,7 @@ pub struct ServeClient {
     calls: mpsc::Sender<Call>,
     pump: tokio::task::JoinHandle<()>,
     observation: Arc<Mutex<Observation>>,
+    residency: watch::Receiver<ServeResidency>,
     sessions: HashMap<String, String>,
     observed_sessions: HashSet<String>,
     pub(crate) request_key: Option<String>,
@@ -137,9 +196,12 @@ impl ServeClient {
         let (calls, mut rx) = mpsc::channel::<Call>(32);
         let observation = Arc::new(Mutex::new(Observation::default()));
         let observed = observation.clone();
+        let (advertise, residency) = watch::channel(ServeResidency::Unknown);
+        let profile = config.profile.clone();
         let pump = tokio::spawn(async move {
             let mut pending: HashMap<u64, Reply> = HashMap::new();
             let mut next_id = 1u64;
+            let mut hello_id = None;
             loop {
                 tokio::select! {
                     call = rx.recv() => {
@@ -157,7 +219,28 @@ impl ServeClient {
                                 // Serve coalesces JSON-RPC frames with newline separators.
                                 for line in text.lines().filter(|line| !line.trim().is_empty()) {
                                     let Ok(frame) = serde_json::from_str::<Value>(line) else { continue };
+                                    if let Some(capability) = ready_residency(&frame) {
+                                        // Written here so it precedes every RPC issued after connect,
+                                        // on every socket. No caller waits on it: a refused hello only
+                                        // leaves this socket pinning sessions, as an old bridge's would.
+                                        if capability.is_supported() && hello_id.is_none() {
+                                            let id = next_id; next_id += 1;
+                                            hello_id = Some(id);
+                                            let hello = json!({"jsonrpc":"2.0", "id":id, "method":"session.client_hello", "params":{"pins_sessions":false, "profile":profile}});
+                                            if !matches!(tokio::time::timeout(Duration::from_secs(10), sink.send(Message::Text(hello.to_string().into()))).await, Ok(Ok(()))) {
+                                                tracing::warn!("Serve client hello could not be written");
+                                            }
+                                        }
+                                        let _ = advertise.send(capability);
+                                        continue;
+                                    }
                                     if let Some(id) = frame.get("id").and_then(Value::as_u64) {
+                                        if hello_id == Some(id) {
+                                            if let Some(error) = frame.get("error") {
+                                                tracing::warn!(%error, "Serve refused client hello; this socket keeps pinning sessions");
+                                            }
+                                            continue;
+                                        }
                                         if let Some(reply) = pending.remove(&id) {
                                             let result = if let Some(error) = frame.get("error") {
                                                 Err(AcpError::AgentError {code:error["code"].as_i64().unwrap_or(-32000), message:error["message"].as_str().unwrap_or("Serve rejected request").to_owned()})
@@ -191,11 +274,20 @@ impl ServeClient {
                 )));
             }
         });
+        // Known before the first RPC on every path that matters. A timeout is tolerated: recovery
+        // re-reads the capability before each attach, so a late frame still stops attach-all.
+        let mut ready = residency.clone();
+        let _ = tokio::time::timeout(
+            READY_WAIT,
+            ready.wait_for(|known| *known != ServeResidency::Unknown),
+        )
+        .await;
         Ok(Self {
             config,
             calls,
             pump,
             observation,
+            residency,
             sessions: HashMap::new(),
             observed_sessions: HashSet::new(),
             request_key: None,
@@ -224,18 +316,19 @@ impl ServeClient {
         Ok(true)
     }
 
+    /// Residency support advertised on the current connection.
+    pub(crate) fn residency(&self) -> ServeResidency {
+        *self.residency.borrow()
+    }
+
     /// Reconcile one durable request without submitting or interrupting work.
     pub(crate) async fn request_status(
         &mut self,
         stored: &str,
         key: &str,
     ) -> Result<Value, AcpError> {
-        self.ensure_attached(stored).await?;
-        self.rpc(
-            "prompt.status",
-            json!({"session_id":self.runtime(stored)?,"client_request_id":key}),
-        )
-        .await
+        self.attached_rpc(stored, "prompt.status", json!({"client_request_id":key}))
+            .await
     }
 
     /// Snapshot for profile-safe activity correlation; transport runtimes are process-unique.
@@ -248,6 +341,17 @@ impl ServeClient {
         self.rpc("session.active_list", json!({})).await
     }
 
+    /// This profile's working or waiting rows, each carrying its `conversation_root`.
+    pub(crate) async fn working_sessions(&self) -> Result<Value, AcpError> {
+        self.rpc("session.active_list", json!({"working_only":true}))
+            .await
+    }
+
+    /// Conversations that must be live for work Serve still owes them.
+    pub(crate) async fn durable_work(&self) -> Result<Value, AcpError> {
+        self.rpc("session.durable_work", json!({})).await
+    }
+
     /// A pool's durable binding can outlive every attachment on this connection.
     pub(crate) async fn ensure_attached(&mut self, stored: &str) -> Result<(), AcpError> {
         self.reconnect_if_closed().await?;
@@ -257,6 +361,33 @@ impl ServeClient {
         Ok(())
     }
 
+    /// Drop a runtime Serve no longer holds, so the stored row gets a fresh attachment.
+    async fn reattach(&mut self, stored: &str) -> Result<(), AcpError> {
+        tracing::warn!(session = stored, "Serve runtime is stale; reattaching");
+        self.sessions.remove(stored);
+        self.observed_sessions.remove(stored);
+        self.session_load(stored, vec![]).await
+    }
+
+    /// Issue one receipt RPC, healing a stale cached runtime once. Receipts make the repeat safe.
+    async fn attached_rpc(
+        &mut self,
+        stored: &str,
+        method: &str,
+        mut params: Value,
+    ) -> Result<Value, AcpError> {
+        self.ensure_attached(stored).await?;
+        params["session_id"] = json!(self.runtime(stored)?);
+        match self.rpc(method, params.clone()).await {
+            Err(error) if runtime_is_stale(&error) => {
+                self.reattach(stored).await?;
+                params["session_id"] = json!(self.runtime(stored)?);
+                self.rpc(method, params).await
+            }
+            result => result,
+        }
+    }
+
     /// Retry one already-journaled request; return admission, never wait for its model turn.
     pub(crate) async fn submit_frozen(
         &mut self,
@@ -264,11 +395,10 @@ impl ServeClient {
         key: &str,
         text: &str,
     ) -> Result<Value, AcpError> {
-        self.ensure_attached(stored).await?;
-        self.rpc(
+        self.attached_rpc(
+            stored,
             "prompt.submit",
-            json!({"session_id":self.runtime(stored)?,"text":text,
-            "queued":true,"client_request_id":key}),
+            json!({"text":text,"queued":true,"client_request_id":key}),
         )
         .await
     }
@@ -492,17 +622,63 @@ impl ServeClient {
         self.in_flight = Some((stored.into(), key.clone()));
         // Correlation and durable intent precede the first await, so a control
         // arriving during reconnect cannot mistake an unsubmitted turn for success.
-        if let Err(error) = self.ensure_attached(stored).await {
-            self.in_flight = None;
-            if let Some(prepared) = &self.prepared {
-                prepared.finish("uncertain")?;
+        let result = self
+            .place_prompt(stored, &key, &payload["text"], max_duration)
+            .await;
+        self.in_flight = None;
+        if let Some(prepared) = &self.prepared {
+            match &result {
+                Err(AcpError::SubmissionUncertain(_)) => prepared.finish("uncertain")?,
+                Err(AcpError::RemoteTurnFailed(_)) => prepared.finish("failed")?,
+                _ => {}
             }
-            return Err(AcpError::SubmissionUncertain(error.to_string()));
         }
-        let runtime = self.runtime(stored)?.to_owned();
+        result
+    }
+
+    /// Attach and run one frozen request. A runtime that vanished proves non-admission there,
+    /// so it heals once with the identical request; the receipt makes the repeat idempotent.
+    async fn place_prompt(
+        &mut self,
+        stored: &str,
+        key: &str,
+        text: &Value,
+        max_duration: Duration,
+    ) -> Result<StopReason, AcpError> {
+        self.ensure_attached(stored).await.map_err(attach_failure)?;
         let deadline = tokio::time::Instant::now() + max_duration;
+        let mut healed = false;
+        loop {
+            let runtime = self.runtime(stored)?.to_owned();
+            match self.submit_and_observe(&runtime, key, text, deadline).await {
+                Err(error) if runtime_is_stale(&error) && !healed => {
+                    healed = true;
+                    self.reattach(stored).await.map_err(attach_failure)?;
+                }
+                Err(error) if runtime_is_stale(&error) => {
+                    return Err(AcpError::SubmissionUncertain(error.to_string()));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Submit once and follow its receipt. A stale-runtime 4001 is returned raw for the caller.
+    async fn submit_and_observe(
+        &self,
+        runtime: &str,
+        key: &str,
+        text: &Value,
+        deadline: tokio::time::Instant,
+    ) -> Result<StopReason, AcpError> {
+        let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
         let submitted = loop {
-            let response=self.rpc("prompt.submit",json!({"session_id":runtime,"text":payload["text"],"queued":true,"client_request_id":key})).await;
+            let response = self
+                .rpc(
+                    "prompt.submit",
+                    json!({"session_id":runtime,"text":text,"queued":true,"client_request_id":key}),
+                )
+                .await;
             match response {
                 Err(AcpError::AgentError { code: 4091, .. })
                     if tokio::time::Instant::now() < deadline =>
@@ -514,17 +690,10 @@ impl ServeClient {
                 response => break response,
             }
         };
-        let result = match submitted {
-            Ok(receipt) => {
-                self.wait_receipt(
-                    &runtime,
-                    &key,
-                    receipt,
-                    deadline.saturating_duration_since(tokio::time::Instant::now()),
-                )
-                .await
-            }
+        match submitted {
+            Ok(receipt) => self.wait_receipt(runtime, key, receipt, remaining()).await,
             Err(AcpError::ServeUnavailable(message)) => Err(AcpError::SubmissionUncertain(message)),
+            Err(error) if runtime_is_stale(&error) => Err(error),
             Err(error) => {
                 // A server error can occur after durable acceptance (for example
                 // a failed receipt write). Resolve admission before declaring failure.
@@ -538,28 +707,12 @@ impl ServeClient {
                     Ok(receipt) if receipt["accepted"] == false => {
                         Err(AcpError::RemoteTurnFailed(error.to_string()))
                     }
-                    Ok(receipt) => {
-                        self.wait_receipt(
-                            &runtime,
-                            &key,
-                            receipt,
-                            deadline.saturating_duration_since(tokio::time::Instant::now()),
-                        )
-                        .await
-                    }
+                    Ok(receipt) => self.wait_receipt(runtime, key, receipt, remaining()).await,
+                    Err(status_error) if runtime_is_stale(&status_error) => Err(status_error),
                     Err(_) => Err(AcpError::SubmissionUncertain(error.to_string())),
                 }
             }
-        };
-        self.in_flight = None;
-        if let Some(prepared) = &self.prepared {
-            match &result {
-                Err(AcpError::SubmissionUncertain(_)) => prepared.finish("uncertain")?,
-                Err(AcpError::RemoteTurnFailed(_)) => prepared.finish("failed")?,
-                _ => {}
-            }
         }
-        result
     }
 
     async fn wait_receipt(
@@ -604,7 +757,13 @@ impl ServeClient {
                     json!({"session_id":runtime,"client_request_id":key}),
                 )
                 .await
-                .map_err(|e| AcpError::SubmissionUncertain(e.to_string()))?;
+                .map_err(|e| {
+                    if runtime_is_stale(&e) {
+                        e
+                    } else {
+                        AcpError::SubmissionUncertain(e.to_string())
+                    }
+                })?;
         }
     }
 
@@ -614,12 +773,8 @@ impl ServeClient {
         stored: &str,
         key: &str,
     ) -> Result<Value, AcpError> {
-        self.ensure_attached(stored).await?;
-        self.rpc(
-            "prompt.cancel",
-            json!({"session_id":self.runtime(stored)?,"client_request_id":key}),
-        )
-        .await
+        self.attached_rpc(stored, "prompt.cancel", json!({"client_request_id":key}))
+            .await
     }
 
     pub(crate) async fn cancel(
@@ -643,7 +798,15 @@ impl ServeClient {
             )
             .await
             .map_err(|e| AcpError::SubmissionUncertain(e.to_string()))?;
-        let result = self.wait_receipt(&runtime, &key, receipt, grace).await;
+        let result = self
+            .wait_receipt(&runtime, &key, receipt, grace)
+            .await
+            .map_err(|e| match e {
+                stale if runtime_is_stale(&stale) => {
+                    AcpError::SubmissionUncertain(stale.to_string())
+                }
+                other => other,
+            });
         self.in_flight = None;
         result
     }
@@ -986,6 +1149,21 @@ mod tests {
             viewer.request_status(&stored, "interop-2").await.unwrap()["status"],
             "running"
         );
+        // Residency contract, against a real Serve while this turn is running.
+        assert!(viewer.residency().is_supported());
+        let working = viewer.working_sessions().await.unwrap();
+        assert!(
+            working["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |row| row["conversation_root"] == stored.as_str() && row["status"] == "working"
+                ),
+            "working row must map to the durable binding: {working}"
+        );
+        let durable = viewer.durable_work().await.unwrap();
+        assert!(durable["sessions"].is_array(), "{durable}");
         drop(viewer);
         drop(client);
         // A restarted bridge has no pool task to signal. Recovery must find the
@@ -1045,6 +1223,29 @@ mod tests {
         );
         assert_eq!(state.inputs(&scope, None).unwrap()[2].status, "completed");
         drop(delayed);
+        // A runtime Serve no longer holds must heal in place, not fence the thread.
+        state
+            .accept_event(&scope, "event-4", &json!({"synthetic":true}))
+            .unwrap();
+        client
+            .sessions
+            .insert(stored.clone(), "runtime-gone-from-serve".into());
+        client.request_key = Some("interop-heal".into());
+        client.prepared = Some(PreparedRequest {
+            state: state.clone(),
+            scope: scope.clone(),
+            event_ids: vec!["event-4".into()],
+        });
+        assert_eq!(
+            client
+                .prompt(&stored, &["interop healed"], Duration::from_secs(15))
+                .await
+                .unwrap(),
+            StopReason::EndTurn
+        );
+        assert_eq!(state.inputs(&scope, None).unwrap()[3].status, "completed");
+        assert!(!state.scope_blocked(&scope).unwrap());
+        client.prepared = None;
         // Cancellation may win the race against a delayed submission on another
         // socket. Its durable tombstone must reject later execution of that key.
         let receipt = client

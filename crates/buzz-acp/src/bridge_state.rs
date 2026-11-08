@@ -322,6 +322,82 @@ impl BridgeState {
         .collect()
     }
 
+    /// Bindings a recovery pass cannot skip: pending controls or unfinished inputs, newest first.
+    pub fn bindings_needing_recovery(&self) -> Result<Vec<(SessionScope, Binding)>> {
+        let conn = self.connection()?;
+        let mut query = conn.prepare(
+            "SELECT b.scope,b.session_id,b.primed,b.generation FROM (
+                SELECT scope,MAX(sequence) latest FROM inputs INDEXED BY inputs_unfinished
+                  WHERE namespace=?1
+                  AND status IN ('queued','submitting','accepted','uncertain') GROUP BY scope
+                UNION ALL
+                SELECT scope,NULL FROM controls WHERE namespace=?1 AND status='pending'
+                  AND scope IS NOT NULL) w
+            JOIN bindings b ON b.namespace=?1 AND b.scope=w.scope
+            WHERE b.session_id IS NOT NULL
+            GROUP BY b.scope ORDER BY MAX(w.latest) IS NULL, MAX(w.latest) DESC, b.scope",
+        )?;
+        let rows = query.query_map([&self.namespace], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Binding {
+                    session_id: row.get(1)?,
+                    primed: row.get(2)?,
+                    generation: row.get(3)?,
+                },
+            ))
+        })?;
+        rows.map(|row| {
+            let (key, binding) = row?;
+            Ok((parse_scope(&key)?, binding))
+        })
+        .collect()
+    }
+
+    /// Bindings holding any of these stored session IDs, in the order the IDs were given.
+    pub fn bindings_for_sessions(
+        &self,
+        session_ids: &[String],
+    ) -> Result<Vec<(SessionScope, Binding)>> {
+        let conn = self.connection()?;
+        let mut query = conn.prepare(
+            "SELECT scope,primed,generation FROM bindings
+            WHERE namespace=? AND session_id=? ORDER BY scope",
+        )?;
+        let mut bindings = Vec::new();
+        for session_id in session_ids {
+            let rows = query.query_map(params![self.namespace, session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    Binding {
+                        session_id: session_id.clone(),
+                        primed: row.get(1)?,
+                        generation: row.get(2)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (key, binding) = row?;
+                bindings.push((parse_scope(&key)?, binding));
+            }
+        }
+        Ok(bindings)
+    }
+
+    /// `(event_id, request_key)` of submitted, unsettled inputs; never reads a payload.
+    pub fn open_requests(&self, scope: &SessionScope) -> Result<Vec<(String, String)>> {
+        let conn = self.connection()?;
+        let mut query = conn.prepare(
+            "SELECT event_id,request_key FROM inputs WHERE namespace=? AND scope=?
+            AND status IN ('submitting','accepted','uncertain') AND request_key IS NOT NULL
+            ORDER BY sequence",
+        )?;
+        let rows = query.query_map(params![self.namespace, scope_key(scope)], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Bindings whose conversation accepted an input after `sequence`, newest first, with the
     /// newest such sequence. `sequence` is the rowid, so only inputs since then are read.
     pub fn bindings_with_input_after(
@@ -528,6 +604,7 @@ impl BridgeState {
     }
 
     /// Include uncertain work for reconciliation and operator status.
+    #[cfg(test)]
     pub fn inputs(&self, scope: &SessionScope, status: Option<&str>) -> Result<Vec<StoredInput>> {
         let conn = self.connection()?;
         let mut statement = conn.prepare(
