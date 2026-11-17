@@ -4787,6 +4787,36 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
     message.contains("Re-authenticate") || message.contains("API Error: 401")
 }
 
+/// A provider refusal that retrying within minutes cannot repair: a spent usage
+/// quota, or a content-policy block. Returns the reason for the thread notice.
+///
+/// Retrying these silently is worse than stopping: the agent looks busy while
+/// every attempt fails, and the ten-retry backoff can hide the failure for half
+/// an hour or more. An ordinary transient rate limit (`HTTP 429: Too Many
+/// Requests`) is not matched and keeps the retry path. The reason never echoes
+/// provider text, so no request content reaches the channel.
+fn provider_refusal_reason(error: &acp::AcpError) -> Option<&'static str> {
+    let text = match error {
+        acp::AcpError::RemoteTurnFailed(text) => text,
+        acp::AcpError::AgentError { message, .. } => message,
+        _ => return None,
+    };
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("usage limit has been reached") || lower.contains("usage_limit_reached") {
+        Some(
+            "the model provider's usage limit has been reached. Nothing was done; \
+             re-send once the limit resets or another model is configured.",
+        )
+    } else if lower.contains("content_policy_blocked") {
+        Some(
+            "the model provider blocked the request under its content policy. Nothing was \
+             done; rephrase the request or route it to another model.",
+        )
+    } else {
+        None
+    }
+}
+
 /// Spawn a task that posts a user-visible failure notice to the relay.
 ///
 /// Shared by the hard-cap immediate dead-letter path and the retries-exhausted
@@ -4945,6 +4975,19 @@ fn handle_prompt_result(
                     different model from the dropdown, and save your changes. Restart the agent \
                     to apply the new configuration, then re-send your request."
                     .to_string();
+                spawn_failure_notice(rest_client, &batch, content);
+            } else if let Some(reason) = match &result.outcome {
+                PromptOutcome::Error(e) => provider_refusal_reason(e),
+                _ => None,
+            } {
+                // A spent quota or a content-policy block will not clear between
+                // retries: say so in the thread now instead of failing silently.
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    "dead-lettering batch immediately — provider refusal"
+                );
+                let content = format!("⚠️ I couldn't process the last request: {reason}");
                 spawn_failure_notice(rest_client, &batch, content);
             } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
                 // Auth errors are non-retryable: the token won't self-repair
@@ -11403,6 +11446,222 @@ mod error_outcome_emission_tests {
         let threading = queue::parse_thread_tags(&notice);
         assert_eq!(threading.root_event_id, Some(root.to_hex()));
         assert_eq!(threading.parent_event_id, Some(parent.to_hex()));
+    }
+
+    /// Drive one failed turn through handle_prompt_result and return the signed
+    /// notice it posted, asserting the batch was dead-lettered (not requeued).
+    async fn assert_refusal_posts_notice_without_retrying(error: AcpError, expected_content: &str) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        let keys = Keys::generate();
+        let root = nostr::EventId::from_byte_array([0xaa; 32]);
+        let parent = nostr::EventId::from_byte_array([0xbb; 32]);
+        let event = EventBuilder::new(Kind::Custom(9), "test")
+            .tags([
+                nostr::Tag::parse(["e", &root.to_hex(), "", "root"]).unwrap(),
+                nostr::Tag::parse(["e", &parent.to_hex(), "", "reply"]).unwrap(),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+        let channel_id = uuid::Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let model_error = error;
+        let expected_error = model_error.to_string();
+        let observer = ObserverHandle::in_process();
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = std::collections::HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Error(model_error),
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            Some(&rest),
+        );
+
+        // The batch must not be requeued: pending_channels returns 0.
+        assert_eq!(
+            queue.pending_channels(),
+            0,
+            "provider refusal must stop immediately — batch must not be requeued"
+        );
+        assert_eq!(
+            queue.queued_event_count(channel_id),
+            0,
+            "provider refusal must stop immediately — no events should be pending"
+        );
+
+        assert!(
+            pool.agents_mut()[0].is_some(),
+            "healthy process remains reusable"
+        );
+        assert!(respawn_tasks.is_empty());
+        let errors: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "turn_error")
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].payload["error"], expected_error);
+
+        // Capture the real signed notice sent by handle_prompt_result, without a live relay.
+        let notice: nostr::Event = tokio::time::timeout(Duration::from_secs(3), async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "POST /events HTTP/1.1\r\n");
+            let mut content_length = None;
+            for _ in 0..64 {
+                line.clear();
+                assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let size = content_length.expect("request Content-Length");
+            assert!(size < 65536);
+            let mut body = vec![0; size];
+            reader.read_exact(&mut body).await.unwrap();
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        })
+        .await
+        .expect("failure notice must be posted on the first failure");
+        notice.verify().unwrap();
+        assert_eq!(notice.pubkey, rest.keys.public_key());
+        assert_eq!(notice.kind, Kind::Custom(9));
+        assert_eq!(notice.content, expected_content);
+        let tags = serde_json::to_value(&notice.tags).unwrap();
+        assert!(tags
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tag| tag[0] == "h" && tag[1] == channel_id.to_string()));
+        let threading = queue::parse_thread_tags(&notice);
+        assert_eq!(threading.root_event_id, Some(root.to_hex()));
+        assert_eq!(threading.parent_event_id, Some(parent.to_hex()));
+    }
+
+    #[tokio::test]
+    async fn usage_limit_posts_notice_without_retrying() {
+        let raw = r#"{"accepted":true,"client_request_id":"buzz:abc","error":"HTTP 429: The usage limit has been reached","status":"failed"}"#;
+        assert_refusal_posts_notice_without_retrying(
+            AcpError::RemoteTurnFailed(raw.to_string()),
+            "⚠️ I couldn't process the last request: the model provider's usage limit has been reached. Nothing was done; re-send once the limit resets or another model is configured.",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn content_policy_block_posts_notice_without_retrying() {
+        let raw = r#"{"accepted":true,"client_request_id":"buzz:abc","error":"content_policy_blocked: This content was flagged for possible cybersecurity risk.","status":"failed"}"#;
+        assert_refusal_posts_notice_without_retrying(
+            AcpError::RemoteTurnFailed(raw.to_string()),
+            "⚠️ I couldn't process the last request: the model provider blocked the request under its content policy. Nothing was done; rephrase the request or route it to another model.",
+        )
+        .await;
+    }
+
+    /// A transient rate limit can clear between retries: keep the retry path.
+    #[tokio::test]
+    async fn transient_rate_limit_is_requeued() {
+        assert_application_error_is_requeued(acp::AcpError::RemoteTurnFailed(
+            r#"{"accepted":true,"error":"HTTP 429: Too Many Requests","status":"failed"}"#
+                .to_string(),
+        ))
+        .await;
+    }
+
+    #[test]
+    fn provider_refusal_reason_matches_quota_and_policy_only() {
+        let usage = acp::AcpError::RemoteTurnFailed(
+            r#"{"error":"Error code: 429 - {'error': {'type': 'usage_limit_reached'}}"}"#
+                .to_string(),
+        );
+        assert!(provider_refusal_reason(&usage).is_some());
+        let credits = acp::AcpError::AgentError {
+            code: -32000,
+            message: "Usage credits required for 1M context".to_string(),
+        };
+        assert!(
+            provider_refusal_reason(&credits).is_none(),
+            "credit prompts keep today's requeue path"
+        );
+        let other =
+            acp::AcpError::RemoteTurnFailed(r#"{"error":"HTTP 500: upstream error"}"#.to_string());
+        assert!(provider_refusal_reason(&other).is_none());
+        let reason = provider_refusal_reason(&acp::AcpError::RemoteTurnFailed(
+            "content_policy_blocked: secret prompt text".to_string(),
+        ))
+        .unwrap();
+        assert!(
+            !reason.contains("secret"),
+            "the notice never echoes provider or request text"
+        );
     }
 
     /// A non-auth application error (e.g. usage credits) must still follow the
